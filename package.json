@@ -1,0 +1,60 @@
+{
+  "name": "projectx-mnq-delta-trend",
+  "version": "1.0.0",
+  "description": "MNQ Delta Trend Trading Strategy for Topstep/ProjectX API",
+  "main": "dist/index.js",
+  "scripts": {
+    "test-connectivity": "ts-node scripts/test-connectivity.ts",
+    "verify": "ts-node src/startup-check.ts",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test-signalr": "ts-node src/scripts/test-signalr.ts"
+  },
+  "keywords": [
+    "topstep",
+    "projectx",
+    "trading",
+    "api",
+    "mnq",
+    "delta",
+    "trend",
+    "strategy",
+    "futures",
+    "trading-bot"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "@microsoft/signalr": "^9.0.6",
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "helmet": "^8.1.0",
+    "morgan": "^1.10.1",
+    "ws": "^8.14.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.23",
+    "@types/morgan": "^1.9.10",
+    "@types/node": "^20.9.0",
+    "@types/ws": "^8.5.9",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/projectx-mnq-delta-trend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/projectx-mnq-delta-trend/issues"
+  },
+  "homepage": "https://github.com/your-username/projectx-mnq-delta-trend#readme"
+}

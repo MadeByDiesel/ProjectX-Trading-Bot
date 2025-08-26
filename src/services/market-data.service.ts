@@ -1,6 +1,16 @@
 import { ProjectXClient } from './projectx-client';
 import { BarData } from '../types';
 import { TimeUtils } from '../utils/time';
+// line 4 (NEW)
+type WarmupConfig = {
+  tradingStartTime: string;
+  tradingEndTime: string;
+  // Strategy lookbacks (optional; used to size warm-up depth safely)
+  atrPeriod?: number;
+  deltaSmaPeriod?: number;
+  breakoutLookback?: number;
+  higherTimeframeWindow?: number;
+};
 
 export class MarketDataService {
   private client: ProjectXClient;
@@ -12,8 +22,9 @@ export class MarketDataService {
   /**
    * Calculates NY session times for a given date using config
    */
-  private calculateNYSessionTimes(config: { tradingStartTime: string; tradingEndTime: string }, date: Date = new Date()): 
+  private calculateNYSessionTimes(config: WarmupConfig, date: Date = new Date()):
     { warmUpStart: Date; sessionStart: Date; sessionEnd: Date } {
+
     
     // Parse config times
     const [startHour, startMinute] = config.tradingStartTime.split(':').map(Number);
@@ -35,44 +46,67 @@ export class MarketDataService {
   /**
    * Fetches 15-minute bars for warm-up period using authenticated client
    */
-  async fetchWarmUpData15min(contractId: string, config: { tradingStartTime: string; tradingEndTime: string }, date: Date = new Date()): Promise<BarData[]> {
+  async fetchWarmUpData15min(contractId: string, config: WarmupConfig, date: Date = new Date()): Promise<BarData[]> {
     const { warmUpStart, sessionStart } = this.calculateNYSessionTimes(config, date);
-    
+
+    // Size history by the largest lookback + safety margin; ensure a reasonable floor for 15m TF
+    const needs = [
+      config.atrPeriod ?? 14,
+      config.deltaSmaPeriod ?? 14,
+      config.breakoutLookback ?? 20,
+      config.higherTimeframeWindow ?? 5
+    ];
+    const minBars = Math.max(...needs) + 50;
+    const limit = Math.max(minBars, 250);
+
     try {
-      // Use the authenticated client to fetch bars - it will handle the time range internally
-      const bars = await this.client.getBars(contractId, '15', 100);
-      
-      // Filter bars to only include the warm-up period
+      const bars = await this.client.getBars(contractId, '15', limit);
+
+      // Prefer the intended warm-up window…
       const warmUpStartTime = warmUpStart.getTime();
       const sessionStartTime = sessionStart.getTime();
-      
-      return bars.filter(bar => {
-        const barTime = new Date(bar.timestamp).getTime();
-        return barTime >= warmUpStartTime && barTime <= sessionStartTime;
+      const windowed = bars.filter(bar => {
+        const t = new Date(bar.timestamp).getTime();
+        return t >= warmUpStartTime && t <= sessionStartTime;
       });
+
+      // …but if the window yields too few bars (e.g., already past session start), fall back to the last minBars
+      if (windowed.length >= minBars) return windowed;
+      return bars.slice(-minBars);
     } catch (error) {
       throw new Error(`Failed to fetch 15min warm-up data: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
+
   /**
    * Fetches 3-minute bars for warm-up period using authenticated client
    */
-  async fetchWarmUpData3min(contractId: string, config: { tradingStartTime: string; tradingEndTime: string }, date: Date = new Date()): Promise<BarData[]> {
+  async fetchWarmUpData3min(contractId: string, config: WarmupConfig, date: Date = new Date()): Promise<BarData[]> {
     const { warmUpStart, sessionStart } = this.calculateNYSessionTimes(config, date);
-    
+
+    // Size history by largest lookback + margin; 3m needs a larger floor
+    const needs = [
+      config.atrPeriod ?? 14,
+      config.deltaSmaPeriod ?? 14,
+      config.breakoutLookback ?? 20,
+      config.higherTimeframeWindow ?? 5
+    ];
+    const minBars = Math.max(...needs) + 50;
+    const limit = Math.max(minBars, 500);
+
     try {
-      // Use the authenticated client to fetch bars
-      const bars = await this.client.getBars(contractId, '3', 100);
-      
-      // Filter bars to only include the warm-up period
+      const bars = await this.client.getBars(contractId, '3', limit);
+
       const warmUpStartTime = warmUpStart.getTime();
       const sessionStartTime = sessionStart.getTime();
-      
-      return bars.filter(bar => {
-        const barTime = new Date(bar.timestamp).getTime();
-        return barTime >= warmUpStartTime && barTime <= sessionStartTime;
+      const windowed = bars.filter(bar => {
+        const t = new Date(bar.timestamp).getTime();
+        return t >= warmUpStartTime && t <= sessionStartTime;
       });
+
+      if (windowed.length >= minBars) return windowed;
+      return bars.slice(-minBars);
     } catch (error) {
       throw new Error(`Failed to fetch 3min warm-up data: ${error instanceof Error ? error.message : String(error)}`);
     }

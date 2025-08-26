@@ -11,7 +11,7 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   deltaSMALength: 9,
   deltaSpikeThreshold: 450,
   deltaSurgeMultiplier: 1.4,
-  breakoutLookbackBars: 99,
+  breakoutLookbackBars: 50,
   deltaSlopeExitLength: 3,
   
   // === EMA CONFIGURATION ===

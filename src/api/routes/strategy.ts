@@ -11,26 +11,43 @@ let activeTrader: MNQDeltaTrendTrader | null = null;
 // Start strategy
 router.post('/start', async (req, res) => {
   try {
-    const config = req.body;
-    
-    // Validate required configuration fields
+    const { forceRestart = false, ...config } = req.body ?? {};
+
+    // Basic validation
     if (!config.symbol || typeof config.symbol !== 'string' || config.symbol.trim() === '') {
       throw new Error('Strategy configuration must include a valid symbol');
     }
-
     if (!config.tradingStartTime || !config.tradingEndTime) {
       throw new Error('Strategy configuration must include trading session times');
     }
-
     if (typeof config.contractQuantity !== 'number' || config.contractQuantity <= 0) {
       throw new Error('Strategy configuration must include valid contract quantity');
     }
 
     const client = getClient();
-    
-    // Validate client is available
     if (!client) {
       throw new Error('Trading client not available');
+    }
+
+    // Prevent duplicate starts unless forced
+    if (activeTrader && !forceRestart) {
+      logger.warn('Start requested but a trader is already running. Rejecting to prevent duplicate instance.');
+      return res.status(409).json({
+        success: false,
+        error: 'Strategy already running. Pass forceRestart=true to restart.'
+      });
+    }
+
+    // Stop existing if forceRestart
+    if (activeTrader && forceRestart) {
+      try {
+        activeTrader.stop();
+        logger.info('Existing trader stopped due to forceRestart.');
+      } catch (e) {
+        logger.warn('Error stopping existing trader on forceRestart (continuing):', e as Error);
+      } finally {
+        activeTrader = null;
+      }
     }
 
     activeTrader = new MNQDeltaTrendTrader(
@@ -38,70 +55,143 @@ router.post('/start', async (req, res) => {
       'http://localhost:3001',
       config
     );
-    
+
     await activeTrader.start();
-    
+
     logger.info(`Strategy started successfully for symbol: ${config.symbol}`);
-    
-    res.json({ 
-      success: true, 
+
+    return res.json({
+      success: true,
       message: 'Strategy started successfully',
-      config 
+      config
     });
   } catch (error) {
     const errorMessage = 'Failed to start strategy: ' + (error as Error).message;
     logger.error(errorMessage, error);
-    res.status(500).json({ 
+    return res.status(500).json({
       success: false,
-      error: errorMessage 
+      error: errorMessage
     });
   }
 });
 
 // Stop strategy
-router.post('/stop', async (req, res) => {
+router.post('/stop', async (_req, res) => {
   try {
-    if (activeTrader) {
-      activeTrader.stop();
-      activeTrader = null;
-      logger.info('Strategy stopped successfully');
+    if (!activeTrader) {
+      return res.json({ success: true, message: 'No active strategy to stop.' });
     }
-    
-    res.json({ 
-      success: true, 
-      message: 'Strategy stopped successfully' 
-    });
+    activeTrader.stop();
+    activeTrader = null;
+    logger.info('Strategy stopped by request.');
+    return res.json({ success: true, message: 'Strategy stopped.' });
   } catch (error) {
     const errorMessage = 'Failed to stop strategy: ' + (error as Error).message;
     logger.error(errorMessage, error);
-    res.status(500).json({ 
-      success: false,
-      error: errorMessage 
-    });
-  }
-});
-
-// Get strategy status
-router.get('/status', async (req, res) => {
-  try {
-    res.json({
-      isRunning: activeTrader !== null,
-      trader: activeTrader ? {
-        isWarmUpComplete: activeTrader.getWarmUpStatus(),
-        contractId: activeTrader.getContractId()
-      } : null
-    });
-  } catch (error) {
-    const errorMessage = 'Failed to get strategy status: ' + (error as Error).message;
-    logger.error(errorMessage, error);
-    res.status(500).json({ 
-      success: false,
-      error: errorMessage 
-    });
+    return res.status(500).json({ success: false, error: errorMessage });
   }
 });
 
 export default router;
+// const router = express.Router();
+// const logger = new Logger('StrategyRoute');
+
+// let activeTrader: MNQDeltaTrendTrader | null = null;
+
+// // Start strategy
+// router.post('/start', async (req, res) => {
+//   try {
+//     const config = req.body;
+    
+//     // Validate required configuration fields
+//     if (!config.symbol || typeof config.symbol !== 'string' || config.symbol.trim() === '') {
+//       throw new Error('Strategy configuration must include a valid symbol');
+//     }
+
+//     if (!config.tradingStartTime || !config.tradingEndTime) {
+//       throw new Error('Strategy configuration must include trading session times');
+//     }
+
+//     if (typeof config.contractQuantity !== 'number' || config.contractQuantity <= 0) {
+//       throw new Error('Strategy configuration must include valid contract quantity');
+//     }
+
+//     const client = getClient();
+    
+//     // Validate client is available
+//     if (!client) {
+//       throw new Error('Trading client not available');
+//     }
+
+//     activeTrader = new MNQDeltaTrendTrader(
+//       client,
+//       'http://localhost:3001',
+//       config
+//     );
+    
+//     await activeTrader.start();
+    
+//     logger.info(`Strategy started successfully for symbol: ${config.symbol}`);
+    
+//     res.json({ 
+//       success: true, 
+//       message: 'Strategy started successfully',
+//       config 
+//     });
+//   } catch (error) {
+//     const errorMessage = 'Failed to start strategy: ' + (error as Error).message;
+//     logger.error(errorMessage, error);
+//     res.status(500).json({ 
+//       success: false,
+//       error: errorMessage 
+//     });
+//   }
+// });
+
+// // Stop strategy
+// router.post('/stop', async (req, res) => {
+//   try {
+//     if (activeTrader) {
+//       activeTrader.stop();
+//       activeTrader = null;
+//       logger.info('Strategy stopped successfully');
+//     }
+    
+//     res.json({ 
+//       success: true, 
+//       message: 'Strategy stopped successfully' 
+//     });
+//   } catch (error) {
+//     const errorMessage = 'Failed to stop strategy: ' + (error as Error).message;
+//     logger.error(errorMessage, error);
+//     res.status(500).json({ 
+//       success: false,
+//       error: errorMessage 
+//     });
+//   }
+// });
+
+// // Get strategy status
+// router.get('/status', async (req, res) => {
+//   try {
+//     res.json({
+//       isRunning: activeTrader !== null,
+//       trader: activeTrader ? {
+//         isWarmUpComplete: activeTrader.getWarmUpStatus(),
+//         contractId: activeTrader.getContractId()
+//       } : null
+//     });
+//   } catch (error) {
+//     const errorMessage = 'Failed to get strategy status: ' + (error as Error).message;
+//     logger.error(errorMessage, error);
+//     res.status(500).json({ 
+//       success: false,
+//       error: errorMessage 
+//     });
+//   }
+// });
+
+// export default router;
 
 
 

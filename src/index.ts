@@ -53,7 +53,7 @@ async function main() {
       MNQ_DELTA_TREND_CONFIG
     );
     
-    await strategy.start();
+    // await strategy.start();
     
     logger.info('✅ Trading bot started successfully');
     logger.info('Waiting for market data and trading signals...');

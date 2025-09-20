@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { Trade } from '../types/strategy'; // Add this import
 
-const API_BASE_URL = 'http://localhost:3001/api';
+const API_BASE_URL = 'http://localhost:4001/api';
 
 const api = axios.create({
   baseURL: API_BASE_URL,

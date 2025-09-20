@@ -1,1 +1,1 @@
-export { ProjectXClient } from './services/api-client';
+export { ApiClient } from './services/api-client';

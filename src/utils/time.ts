@@ -1,10 +1,13 @@
+// src/utils/time.ts
+
 export class TimeUtils {
   /** Return a Date that represents "now" as an absolute instant aligned to the target IANA zone. */
   static nowInZone(timeZone: string): Date {
     const now = new Date();
+    // Create a "local-looking" time in the target zone, then compute the offset back to UTC
     const inv = new Date(now.toLocaleString('en-US', { timeZone }));
     const diff = now.getTime() - inv.getTime();
-    return new Date(now.getTime() + diff);
+    return new Date(now.getTime() - diff);
   }
 
   /** Build an absolute Date for TODAY at HH:mm in the given IANA zone. */
@@ -17,15 +20,30 @@ export class TimeUtils {
   }
 
   /**
-   * NY-session check. Same signature as before to preserve call sites,
-   * but evaluates in America/New_York (DST-safe).
+   * Default trading-hours check in New York (DST-safe).
+   * Signature unchanged for existing call sites.
    */
   static isWithinTradingHours(startTime: string, endTime: string): boolean {
-    const TZ = 'America/New_York';
-    const zNow = this.nowInZone(TZ);
-    const start = this.todayAtInZone(startTime, TZ);
-    const end   = this.todayAtInZone(endTime, TZ);
-    return zNow >= start && zNow <= end;
+    return this.isWithinTradingHoursInTZ(startTime, endTime, 'America/New_York');
+  }
+
+  /**
+   * General trading-hours check for any IANA timezone.
+   * Handles same-day windows (e.g., 09:30–16:00) and wraps (e.g., 22:00–02:00).
+   */
+  static isWithinTradingHoursInTZ(startTime: string, endTime: string, timeZone: string): boolean {
+    const nowZ   = this.nowInZone(timeZone);
+    const startZ = this.todayAtInZone(startTime, timeZone);
+    const endZ   = this.todayAtInZone(endTime,   timeZone);
+
+    if (endZ >= startZ) {
+      // normal same-day window
+      return nowZ >= startZ && nowZ <= endZ;
+    } else {
+      // window that crosses midnight in the target TZ
+      // e.g., 22:00–02:00 means (now >= 22:00 today) OR (now <= 02:00 today)
+      return nowZ >= startZ || nowZ <= endZ;
+    }
   }
 
   /**

@@ -1,21 +1,15 @@
-import { initializeClient, getClient } from './services/client-manager';
-import { ProjectXClient } from './services/projectx-client';
-import { MarketDataService } from './services/market-data.service';
-import { ApiService } from './services/api.service';
-import { MNQDeltaTrendTrader } from './strategies/mnq-delta-trend/trader';
-import { MNQ_DELTA_TREND_CONFIG } from './strategies/mnq-delta-trend/config';
+// src/index.ts
+import { initializeClient } from './services/client-manager';
 import { Logger } from './utils/logger';
 import { Account, ProjectXConfig } from './types';
 import * as dotenv from 'dotenv';
 import './api/server';
 
 console.log('🚀 Starting ProjectX Trading Bot and API Server...');
-// Load environment variables
 dotenv.config();
 
 const logger = new Logger('MainApp');
 
-// Your configuration
 const config: ProjectXConfig = {
   baseURL: process.env.API_BASE_URL || 'https://api.topstepx.com',
   userName: process.env.PROJECTX_USERNAME || '',
@@ -27,43 +21,34 @@ async function main() {
     logger.info('🚀 Starting ProjectX MNQ Delta Trend Trading Bot');
     logger.info('=============================================');
 
-    // Check environment variables
     if (!config.apiKey || !config.userName) {
       throw new Error('Missing PROJECTX_API_KEY or PROJECTX_USERNAME environment variables');
     }
 
-    // Initialize client using the client manager
+    // Initialize the shared client used by the API + UI-triggered strategy
     const client = await initializeClient(config);
-    
-    logger.info('Initializing trading bot...');
-    
-    // Get and display account information
+
+    // Show accounts for visibility
     const accounts = await client.getAccounts();
     logger.info(`Found ${accounts.length} account(s):`);
-    
     accounts.forEach((account: Account, index: number) => {
       logger.info(`  ${index + 1}. ${account.name} - $${account.balance.toFixed(2)}`);
     });
 
-    // Create and start strategy - FIXED: Pass base URL string
-    logger.info('Starting MNQ Delta Trend strategy...');
-    const strategy = new MNQDeltaTrendTrader(
-      client, 
-      'http://localhost:3001', // Your internal API base URL
-      MNQ_DELTA_TREND_CONFIG
-    );
-    
-    // await strategy.start();
-    
-    logger.info('✅ Trading bot started successfully');
-    logger.info('Waiting for market data and trading signals...');
+    // IMPORTANT: Do not start the strategy here.
+    // The UI will start/stop the strategy to avoid duplicate instances.
+    logger.info('✅ API server is up. Strategy will be started/stopped via the UI.');
 
-
-    // Graceful shutdown handling
+    // Graceful shutdown
     process.on('SIGINT', async () => {
       logger.info('Shutting down trading bot...');
-      strategy.stop();
-      await client.disconnectWebSocket();
+      try {
+        if (client.isWebSocketConnected()) {
+          await client.disconnectWebSocket();
+        }
+      } catch (err) {
+        logger.error('Error during shutdown:', err);
+      }
       logger.info('Trading bot stopped gracefully');
       process.exit(0);
     });
@@ -74,7 +59,6 @@ async function main() {
   }
 }
 
-// Handle uncaught errors
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught exception:', error);
   process.exit(1);
@@ -85,7 +69,6 @@ process.on('unhandledRejection', (reason, promise) => {
   process.exit(1);
 });
 
-// Start the application
 main().catch(error => {
   logger.error('Unhandled error in main:', error);
   process.exit(1);

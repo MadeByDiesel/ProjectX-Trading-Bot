@@ -1,60 +1,72 @@
+
+// === Strategy configuration (Pine-parity) ===
 export interface StrategyConfig {
-    // === SYMBOL CONFIG ===
-  symbol: string; // Add this property
-  // === TIME FILTER ===
-  tradingStartTime: string;
-  tradingEndTime: string;
-  
-  // === DELTA CONFIGURATION ===
-  deltaSMALength: number;              // Delta SMA Length
-  deltaSpikeThreshold: number;         // Delta Spike Threshold (absolute value)
-  deltaSurgeMultiplier: number;        // Delta Surge Multiplier
-  breakoutLookbackBars: number;        // Breakout lookback bars
-  deltaSlopeExitLength: number;        // Delta Slope Exit Length
-  
-  // === EMA CONFIGURATION ===
-  emaLength: number;                   // EMA length
-  useEmaFilter: boolean;               // Use EMA filter checkbox
-  htfEMALength: number;                // HTF EMA length
-  higherTimeframe: number;             // Higher time frame (mins)
-  
-  // === ATR & EXIT CONFIGURATION ===
-  atrProfitMultiplier: number;         // ATR profit multiplier
-  atrStopLossMultiplier: number;       // ATR Stop Loss Multiplier
-  minAtrToTrade: number;               // Min ATR to trade
-  minBarsBeforeExit: number;           // Min Bars before exit
-  
-  // === TRAILING STOP CONFIGURATION ===
-  useTrailingStop: boolean;            // Use Trailing Stop checkbox
-  trailActivationATR: number;          // Trail activation (ATR Multiplier)
-  trailOffsetATR: number;              // Trail offset (ATR Multiplier)
-  
-  // === POSITION SIZING ===
-  contractQuantity: number;            // Contract quantity
-  
-  // === RISK MANAGEMENT ===
+  // SYMBOL / SESSION
+  symbol: string;
+  tradingStartTime: string; // e.g. '9:30' ET
+  tradingEndTime: string;   // e.g. '16:00' ET
+
+  // DELTA
+  deltaSMALength: number;
+  deltaSpikeThreshold: number;   // absolute threshold (Pine uses signed volume)
+  deltaSurgeMultiplier: number;
+  breakoutLookbackBars: number;
+  deltaSlopeExitLength: number;
+
+  // EMA (LTF + HTF)
+  emaLength: number;             // LTF EMA length (3-minute)
+  useEmaFilter: boolean;
+  htfEMALength: number;          // HTF EMA length
+  higherTimeframe: number;       // HTF in minutes (e.g. 15)
+
+  // ATR / EXITS
+  atrProfitMultiplier: number;
+  atrStopLossMultiplier: number;
+  minAtrToTrade: number;
+  minBarsBeforeExit: number;
+
+  // TRAILING STOP (ATR-based; Pine parity)
+  useTrailingStop: boolean;
+  trailActivationATR: number;
+  trailOffsetATR: number;
+
+  // POSITION SIZING
+  contractQuantity: number;
+
+  // RISK (kept for app-level risk management; not Pine logic)
   dailyProfitTarget: number;
   maxTotalDrawdown: number;
   maxDailyDrawdown: number;
+
+  // Pine parity helpers
+  requireDelta?: boolean; // if true, bar.delta must be provided (else hold)
+  deltaScale?: number;    // scale factor to match Pine’s delta magnitude (default 1)
+
+  htfUseForming?: boolean; 
 }
 
-// Keep your existing other types but update StrategyConfig
+// === Bar / Market / Signal types used by calculator & trader ===
 export interface BarData {
-  timestamp: string;
+  timestamp: string; // ISO
   open: number;
   high: number;
   low: number;
   close: number;
   volume: number;
-  delta?: number;
+  delta?: number;    // signed volume for Pine parity
 }
 
 export interface MarketState {
-  currentPrice: number;
+  // Optional current price snapshot for UI/logging
+  currentPrice?: number;
+
+  // Calculator-populated
   atr: number;
   higherTimeframeTrend: 'bullish' | 'bearish' | 'neutral';
   deltaCumulative: number;
-  previousBars: BarData[];
+
+  // Optional history cache (some callers don’t use it)
+  previousBars?: BarData[];
 }
 
 export interface TradeSignal {
@@ -69,6 +81,6 @@ export interface PositionState {
   stopLoss: number;
   takeProfit: number;
   positionSize: number;
-  direction: 'long' | 'short' | 'none'; // Add 'none' to allowed values
-  entryTime: number;
+  direction: 'long' | 'short' | 'none';
+  entryTime: number; // epoch ms
 }

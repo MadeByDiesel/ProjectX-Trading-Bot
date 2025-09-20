@@ -1,910 +1,397 @@
 // src/strategies/mnq-delta-trend/trader.ts
-
 import { ProjectXClient } from '../../services/projectx-client';
-import { ApiClient } from '../../services/api-client';
-import { MarketDataService } from '../../services/market-data.service';
 import { MNQDeltaTrendCalculator } from './calculator';
-import { StrategyConfig, PositionState, MarketState, BarData } from './types';
-import { Logger } from '../../utils/logger';
-import {
-  GatewayQuote,
-  OrderSide,
-  OrderType,
-  GatewayUserPosition
-} from '../../types';
+import { StrategyConfig } from './types'; // uses your local MNQ types
+import { GatewayQuote, BarData } from '../../types'; // SignalR types come from global app types
 
 export class MNQDeltaTrendTrader {
   private client: ProjectXClient;
-  private marketDataService: MarketDataService;
   private calculator: MNQDeltaTrendCalculator;
-  private config: StrategyConfig;
-  private positionState: PositionState;
-  private marketState: MarketState;
-  private isTradingHours = false;
-  private isWarmUpComplete = false;
-  private logger: Logger;
-  private mnqContractId: string | null = null;
-  private apiClient: ApiClient;
+  private readonly config: StrategyConfig;  
 
-  // --- de-dupe guard for repeated market data frames ---
-  private lastTickSig: string | null = null;
-  private lastTickAt: number = 0;
-  private static readonly DEDUPE_MS = 300; // ignore identical frames within this window
+  private contractId: string;
+  private symbol: string;
 
-  constructor(client: ProjectXClient, baseURL: string, config: StrategyConfig) {
-    this.client = client;
-    this.apiClient = new ApiClient(baseURL);
-    this.marketDataService = new MarketDataService(client);
-    this.config = config;
-    this.calculator = new MNQDeltaTrendCalculator(config);
-    this.logger = new Logger('MNQDeltaTrend');
+  // Tick → bar accumulators
+  private lastPriceByContract = new Map<string, number>();
+  private lastCumVolByContract = new Map<string, number>();
+  private signedVolInBarByContract = new Map<string, number>();
+  private volInBarByContract = new Map<string, number>();
 
-    this.positionState = {
-      isInPosition: false,
-      entryPrice: 0,
-      stopLoss: 0,
-      takeProfit: 0,
-      positionSize: 0,
-      direction: 'none',
-      entryTime: 0
-    };
+  // Open 3m bar state
+  private barOpenPx: number | null = null;
+  private barHighPx: number | null = null;
+  private barLowPx: number | null = null;
+  private barStartMs: number | null = null; // start time (bucket) in ms
+  private readonly barStepMs = 3 * 60 * 1000; // 3-minute bars
 
-    this.marketState = {
-      currentPrice: 0,
-      atr: 0,
-      higherTimeframeTrend: 'neutral',
-      deltaCumulative: 0,
-      previousBars: []
-    };
+  private running = false;
+  private heartbeat: NodeJS.Timeout | null = null;
+  // Pyramiding / race guards
+  private exitingNow = false;         // already in your file if you added earlier
+  private localOpenQty = 0;           // optimistic local net qty (blocks new entries)
+  private entryCooldownUntil = 0;     // ms timestamp to delay re-entry after a flatten
+  private sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
+  
+  // Minimal market state; calculator maintains ATR/HTF internally after warm-up
+  private marketState = {
+    atr: 0,
+    higherTimeframeTrend: 'neutral' as 'bullish' | 'bearish' | 'neutral',
+    deltaCumulative: 0
+  };
 
-    this.setupEventListeners();
+  // Keep a bound handler so we can remove/ignore as needed
+  private marketDataHandler = (q: GatewayQuote & { contractId: string }) => this.onQuote(q);
+
+  constructor(opts: {
+    client: ProjectXClient;
+    calculator: MNQDeltaTrendCalculator;
+    config: StrategyConfig;
+    contractId: string;
+    symbol: string;
+  }) {
+    this.client = opts.client;
+    this.calculator = opts.calculator;
+    this.config = opts.config;
+    this.contractId = opts.contractId;
+    this.symbol = opts.symbol;
+
+    console.info('[MNQDeltaTrend][Config:Trader]', this.config);
   }
 
-  // relaxed match helper for either symbol or contractId
-  private matchesSymbolOrContract(q: { symbol?: string; contractId?: string }): boolean {
-    const feedSym = q.symbol ?? '';
-    const want = this.config.symbol;
-    const symOk = feedSym === want || feedSym.endsWith(want);
-    const cidOk = this.mnqContractId ? q.contractId === this.mnqContractId : false;
-    return symOk || cidOk;
-  }
+  /** Call once to start streaming. */
+  public async start(): Promise<void> {
+    this.running = true;
 
-  async start(): Promise<void> {
-    this.logger.info('Starting MNQ Delta Trend Strategy');
-
-    // Log the active config at strategy start
-    this.logger.info('Strategy configuration:', JSON.stringify(this.config, null, 2));
-
-    // 1) Warm-up using historical bars
-    await this.initializeWarmUpData();
-
-    // 2) Connect realtime + subscribe (by SYMBOL — matches ProjectXClient API)
+    // Ensure WS connected & subscribed
     await this.client.connectWebSocket();
-    await this.client.subscribeToSymbols([this.config.symbol]);
+    await this.client.getSignalRService().subscribeToMarketData(this.contractId);
+
+    // Wire the handler
+    this.client.onMarketData(this.marketDataHandler);
+
+    // Heartbeat to close bars across minute boundaries even if a boundary tick is late
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = setInterval(() => {
+      if (!this.running) return;
+      this.maybeCloseBarByClock();
+    }, 1000);
+
+    console.info(`[MNQDeltaTrend][Trader] started for ${this.symbol} (contractId=${this.contractId})`);
+
+    // Log the *exact* effective config the calculator will trade with
+    const eff = this.calculator.getConfig()
+    console.info('[MNQDeltaTrend][CONFIG:start]', {
+      hash: (eff ? (/* reuse same hash impl here or inline: */ 
+        (() => {
+          const s = JSON.stringify(eff, Object.keys(eff).sort());
+          let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
+          return (h >>> 0).toString(16).padStart(8, '0');
+        })()
+      ) : '----'),
+      effective: eff
+    });
   }
 
-  private async initializeWarmUpData(): Promise<void> {
-    try {
-      this.logger.info('Fetching historical data for strategy warm-up...');
-
-      // Search MNQ contracts
-      const contracts = await this.client.searchContracts('MNQ');
-      if (contracts.length === 0) {
-        throw new Error('No MNQ contracts found');
-      }
-
-      this.logger.info(`Found ${contracts.length} MNQ contracts:`);
-      contracts.forEach((c, i) => {
-        this.logger.info(
-          `  ${i + 1}. ${c.name} - ${c.description} (Active: ${c.activeContract})`
-        );
-      });
-
-      // Pick most current active MNQ
-      const activeMNQ = contracts.filter(
-        (c) => c.activeContract && (c.symbolId.includes('MNQ') || c.name.includes('MNQ'))
-      );
-      if (activeMNQ.length === 0) {
-        throw new Error('No active MNQ contracts found');
-      }
-
-      const mostCurrent = activeMNQ.sort((a, b) => b.name.localeCompare(a.name))[0];
-      this.mnqContractId = mostCurrent.id;
-      this.logger.info(`✅ Selected most current MNQ contract: ${mostCurrent.name} - ${mostCurrent.description}`);
-
-      // Pull warm-up bars
-      const warmupCfg = this.buildWarmupConfig();
-      const [bars15, bars3] = await Promise.all([
-        this.marketDataService.fetchWarmUpData15min(this.mnqContractId, warmupCfg),
-        this.marketDataService.fetchWarmUpData3min(this.mnqContractId, warmupCfg)
-      ]);
-
-      bars15.forEach((bar) => this.calculator.processWarmUpBar(bar, '15min'));
-      bars3.forEach((bar) => this.calculator.processWarmUpBar(bar, '3min'));
-
-      this.calculator.completeWarmUp();
-      this.isWarmUpComplete = true;
-
-      this.logger.info(`✅ Warm-up complete: ${bars15.length}15min bars, ${bars3.length}3min bars`);
-    } catch (err) {
-      this.logger.error('Warm-up initialization failed:', err);
-      throw err;
+  /** Optional: stop receiving data & clear timers. Safe to call multiple times. */
+  public async stop(): Promise<void> {
+    this.running = false;
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = null;
     }
+    // We can’t unregister the callback from SignalRService (no .off), so we guard with this.running flag
+    // Disconnect websocket to be clean
+    try { await this.client.disconnectWebSocket(); } catch {}
+    console.info('[MNQDeltaTrend][Trader] stopped');
   }
 
-  private setupEventListeners(): void {
-    // Real-time market data (quotes)
-    this.client.onMarketData((raw: GatewayQuote & { contractId?: string; timestamp?: string | number }) => {
-      const data = raw as GatewayQuote & { contractId?: string; timestamp?: string | number };
+  private async onQuote(quote: GatewayQuote & { contractId: string }): Promise<void> {
+    if (!this.running) return;
+    if (quote.contractId !== this.contractId) return;
 
-      // gate by symbol or contract
-      if (!this.matchesSymbolOrContract({ symbol: (data as any).symbol, contractId: data.contractId as any })) return;
+    const contractId = quote.contractId;
+    const px = quote.lastPrice;
+    if (!Number.isFinite(px)) return;
 
-      // normalize lastPrice if missing
-      if (typeof data.lastPrice !== 'number' || Number.isNaN(data.lastPrice)) {
-        const p = (data as any).tradePrice ?? (data as any).close ?? (data as any).mark;
-        const bid = (data as any).bid;
-        const ask = (data as any).ask;
-        const mid = (typeof bid === 'number' && typeof ask === 'number') ? (bid + ask) / 2 : undefined;
-        if (typeof p === 'number') (data as any).lastPrice = p;
-        else if (typeof mid === 'number') (data as any).lastPrice = mid;
-      }
-
-      // throttle "incomplete" spam logs
-      if (typeof data.lastPrice !== 'number' || Number.isNaN(data.lastPrice)) {
-        const now = Date.now();
-        if (now - this.lastTickAt > 1000) {
-          this.logger.debug(`Skipping incomplete quote for ${(data as any).symbol ?? 'N/A'}`);
-          this.lastTickAt = now;
+    // Reconcile: calc says flat but we hold a local lock → sync with broker
+    if (!this.calculator.hasPosition() && this.localOpenQty > 0 && !this.exitingNow) {
+      try {
+        const net = await this.client.getNetPositionSize(this.contractId);
+        if (Math.abs(net) === 0) {
+          // Do NOT unlock on an unconfirmed “flat” snapshot (polls can lag/429).
+          console.warn('[MNQDeltaTrend][RECONCILE] broker reports flat (unconfirmed); keeping local lock');
+          // no-op: keep this.localOpenQty as-is
+        } else {
+          // Broker shows open qty → flatten now with one-shot flatten API
+          console.warn('[MNQDeltaTrend][RECONCILE] broker shows open qty; flattening', { net });
+          this.exitingNow = true;
+          try {
+            await this.client.closePosition(this.contractId);
+            this.localOpenQty = 0;
+          } finally {
+            this.exitingNow = false;
+          }
         }
+      } catch (e) {
+        console.error('[MNQDeltaTrend][RECONCILE] failed:', e as any);
+        // keep lock on error
+      }
+    }
+
+    // ---- Intrabar protective stop / trailing stop check (tick-level) ----
+    if (this.calculator.hasPosition()) {
+      const hit = this.calculator.onTickForProtectiveStops(px, this.marketState.atr ?? NaN);
+      if (hit === 'hitStop' || hit === 'hitTrail') {
+        console.info(
+          '[MNQDeltaTrend][EXIT]',
+          hit === 'hitStop' ? 'stop hit (tick)' : 'trail hit (tick)',
+          {
+            px,
+            stop:  (this as any).calculator?.['currentPosition']?.stopLoss,
+            trail: (this as any).calculator?.['trailingStopLevel']
+          }
+        );
+
+        // Robust flatten: single broker flatten; avoid quantity loops/spam
+        this.exitingNow = true;
+        try {
+          await this.client.closePosition(this.contractId);   // one-shot flatten
+          console.info('[MNQDeltaTrend][EXIT] flattened via closePosition');
+          // Clear calc & local locks, add brief cooldown
+          this.calculator.clearPosition();
+          this.localOpenQty = 0;
+          const cdMs = (this.config as any)?.entryCooldownMs ?? 8000;
+          this.entryCooldownUntil = Date.now() + cdMs;
+        } catch (err) {
+          console.error('[MNQDeltaTrend][EXIT] flatten failed:', err as any);
+          // keep lock; cooldown briefly to prevent re-entry churn after failure
+          this.entryCooldownUntil = Date.now() + 10000;
+        } finally {
+          this.exitingNow = false;
+        }
+
+        // Don’t use this tick for bar building after exit
         return;
       }
+    }
 
-      // de-dupe identical frames in a short window
-      const ts = typeof data.timestamp === 'number'
-        ? data.timestamp
-        : (data.timestamp ? Date.parse(data.timestamp as string) : Date.now());
+    // ---------- accumulate per-tick volume & signed volume ----------
+    // SignalR GatewayQuote.volume is cumulative session volume
+    const cumVol = (quote as any).volume ?? 0;
+    const prevPx = this.lastPriceByContract.get(contractId);
+    const prevCum = this.lastCumVolByContract.get(contractId);
 
-      const deltaVal = (data as any).change ?? (data as any).delta ?? 'NA';
-      const sig = `${data.contractId ?? ''}|${(data as any).symbol ?? ''}|${data.lastPrice}|${deltaVal}|${Math.floor(ts / 1000)}`;
+    let dVol = 0;
+    if (typeof prevCum === 'number' && cumVol >= prevCum) dVol = cumVol - prevCum;
 
-      const nowMs = Date.now();
-      if (this.lastTickSig === sig && (nowMs - this.lastTickAt) < MNQDeltaTrendTrader.DEDUPE_MS) {
-        return; // drop duplicate tick
-      }
-      this.lastTickSig = sig;
-      this.lastTickAt = nowMs;
+    let signed = 0;
+    if (typeof prevPx === 'number') {
+      if (px > prevPx) signed = dVol;
+      else if (px < prevPx) signed = -dVol;
+      else signed = 0;
+    }
 
-      // proceed to strategy pipeline
-      this.processQuote(data as GatewayQuote & { contractId: string });
-    });
-
-    // User order/position updates
-    this.client.onOrderUpdate((order) => {
-      this.logger.info(`Order update: ${order.status}`);
-    });
-
-    this.client.onPositionUpdate((position: GatewayUserPosition) => {
-      if (this.mnqContractId && position.contractId === this.mnqContractId) {
-        this.handleNewPosition(position);
-      }
-    });
-
-    this.client.onConnected(() => {
-      this.logger.info('Real-time data connected - strategy ready');
-    });
-  }
-
-  private processQuote(data: GatewayQuote & { contractId: string }): void {
-    // Single, consistent debug line
-    this.logger.debug(
-      `Tick ${(data as any).symbol ?? 'N/A'} @ ${data.lastPrice} Δ:${(data as any).change ?? 'n/a'}`
+    this.volInBarByContract.set(
+      contractId,
+      (this.volInBarByContract.get(contractId) ?? 0) + (Number.isFinite(dVol) ? dVol : 0)
+    );
+    this.signedVolInBarByContract.set(
+      contractId,
+      (this.signedVolInBarByContract.get(contractId) ?? 0) + (Number.isFinite(signed) ? signed : 0)
     );
 
-    if (!this.isWarmUpComplete) {
-      this.logger.debug('Signal: hold, Reason: Warm-up in progress');
+    this.lastPriceByContract.set(contractId, px);
+    this.lastCumVolByContract.set(contractId, cumVol);
+
+    // ---------- 3-minute bar bucketing ----------
+    const nowMs = Date.now();
+    const bucketStart = Math.floor(nowMs / this.barStepMs) * this.barStepMs;
+
+    // first tick ever or first tick of a new bucket
+    if (this.barStartMs === null) {
+      this.barStartMs = bucketStart;
+      this.barOpenPx = px;
+      this.barHighPx = px;
+      this.barLowPx = px;
+      console.debug(`[MNQDeltaTrend][barOpen] ${new Date(this.barStartMs).toISOString()} O=${px}`);
       return;
     }
 
-    // Update market state
-    this.marketState.currentPrice = data.lastPrice;
+    if (bucketStart > this.barStartMs) {
+      // crossed into a new bucket → close prior bar and open new one with this tick
+      this.closeBarAndProcess();
+      this.barStartMs = bucketStart;
+      this.barOpenPx = px;
+      this.barHighPx = px;
+      this.barLowPx = px;
+      console.debug(`[MNQDeltaTrend][barOpen] ${new Date(this.barStartMs).toISOString()} O=${px}`);
+      return;
+    }
 
-    // Respect trading window
-    this.isTradingHours = this.marketDataService.isWithinTradingHours(
-      this.config.tradingStartTime,
-      this.config.tradingEndTime
+    // update current open bar extremes
+    if (this.barHighPx !== null) this.barHighPx = Math.max(this.barHighPx, px);
+    if (this.barLowPx !== null)  this.barLowPx  = Math.min(this.barLowPx,  px);
+  }
+
+  /** Heartbeat: if the wall-clock bucket advanced but we haven’t seen a tick yet, close bar anyway */
+  private maybeCloseBarByClock(): void {
+    if (!this.running) return;
+    if (this.barStartMs === null) return;
+
+    const nowMs = Date.now();
+    const bucketStart = Math.floor(nowMs / this.barStepMs) * this.barStepMs;
+    if (bucketStart > this.barStartMs) {
+      // If we have a last price, use it as close; otherwise we cannot close
+      const lastPx = this.lastPriceByContract.get(this.contractId);
+      if (!Number.isFinite(lastPx)) return;
+
+      this.closeBarAndProcess();
+
+      // Open the new bar with last price until next tick updates it
+      this.barStartMs = bucketStart;
+      this.barOpenPx = lastPx!;
+      this.barHighPx = lastPx!;
+      this.barLowPx = lastPx!;
+      console.debug(`[MNQDeltaTrend][barOpen:HB] ${new Date(this.barStartMs).toISOString()} O=${lastPx}`);
+    }
+  }
+
+  private closeBarAndProcess(): void {
+    if (this.barStartMs === null || this.barOpenPx === null || this.barHighPx === null || this.barLowPx === null) {
+      return;
+    }
+
+    const contractId = this.contractId;
+    const closePx = this.lastPriceByContract.get(contractId);
+    if (!Number.isFinite(closePx)) return;
+
+    const volume = Math.max(0, Math.floor(this.volInBarByContract.get(contractId) ?? 0));
+    const signed = Math.trunc(this.signedVolInBarByContract.get(contractId) ?? 0);
+
+    const barEndIso = new Date(this.barStartMs + this.barStepMs - 1).toISOString(); // close timestamp
+
+    const closedBar: BarData = {
+      timestamp: barEndIso,
+      open: this.barOpenPx,
+      high: this.barHighPx,
+      low: this.barLowPx,
+      close: closePx!,
+      volume: volume,
+      delta: signed, // Pine parity: signed volume
+    };
+
+    // reset accumulators for next bar
+    this.volInBarByContract.set(contractId, 0);
+    this.signedVolInBarByContract.set(contractId, 0);
+
+    // let calculator handle indicators & signals
+    const signal = this.calculator.processNewBar(closedBar as any, this.marketState as any);
+    this.handleSignal(signal, closedBar);
+
+    console.debug(
+      `[MNQDeltaTrend][barClose] t=${closedBar.timestamp} O:${closedBar.open} H:${closedBar.high} L:${closedBar.low} C:${closedBar.close} Δ:${closedBar.delta} V:${closedBar.volume}`
     );
-    if (!this.isTradingHours) {
-      if (this.positionState.isInPosition) {
-        // flatten if outside trading hours
-        this.closePosition('Outside trading hours').catch((err) =>
-          this.logger.error('Close position error (outside hours):', err)
-        );
+
+    // prepare for next bar defaults (the opener is set in onQuote or heartbeat)
+    this.barOpenPx = closePx!;
+    this.barHighPx = closePx!;
+    this.barLowPx = closePx!;
+  }
+
+  private async handleSignal(
+    signal: { signal: 'buy' | 'sell' | 'hold'; reason: string; confidence: number },
+    bar: BarData
+  ) {
+    if (signal.signal === 'hold') return;
+
+    const posDir = this.calculator.getPositionDirection();
+    const isExitOfLong  = posDir === 'long'  && signal.signal === 'sell';
+    const isExitOfShort = posDir === 'short' && signal.signal === 'buy';
+
+    // ---------- EXIT (flatten, do not reverse) ----------
+    if (isExitOfLong || isExitOfShort) {
+      console.info('[MNQDeltaTrend][EXIT] flattening', { posDir, reason: signal.reason });
+      this.exitingNow = true;
+      try {
+        await this.client.closePosition(this.contractId);   // one-shot flatten
+        this.calculator.clearPosition();
+        this.localOpenQty = 0;
+        const cdMs = (this.config as any)?.entryCooldownMs ?? 8000;
+        this.entryCooldownUntil = Date.now() + cdMs;
+      } catch (err) {
+        console.error('[MNQDeltaTrend][EXIT] flatten failed:', err as any);
+        // keep lock; cooldown to prevent immediate churn
+        this.entryCooldownUntil = Date.now() + 10000;
+      } finally {
+        this.exitingNow = false;
       }
       return;
     }
 
-    // Build a 1-tick bar and process
-    const bar = this.createBarFromQuote(data);
-    this.processNewBar(bar).catch((err) =>
-      this.logger.error('Error processing new bar:', err)
-    );
-  }
-
-  private createBarFromQuote(quote: GatewayQuote): BarData {
-    return {
-      timestamp: new Date().toISOString(),
-      open: quote.lastPrice,
-      high: quote.lastPrice,
-      low: quote.lastPrice,
-      close: quote.lastPrice,
-      volume: typeof (quote as any).volume === 'number' ? (quote as any).volume : 0,
-      delta: typeof (quote as any).change === 'number' ? (quote as any).change : 0
-    };
-  }
-
-  private buildWarmupConfig() {
-    return {
-      atrPeriod: 14,                                         // standard ATR lookback
-      deltaSmaPeriod: this.config.deltaSMALength,            // from StrategyConfig
-      breakoutLookback: this.config.breakoutLookbackBars,    // from StrategyConfig
-      higherTimeframeWindow: 5,                              // matches our HTF window usage
-      tradingStartTime: this.config.tradingStartTime,        // REQUIRED by WarmupConfig
-      tradingEndTime: this.config.tradingEndTime             // REQUIRED by WarmupConfig
-    };
-  }
-
-  private async processNewBar(bar: BarData): Promise<void> {
-    // Trace newly constructed bar once (no duplicates)
-    this.logger.debug(
-      `New bar: ${bar.timestamp} O:${bar.open} H:${bar.high} L:${bar.low} C:${bar.close}`
-    );
-
-    const { signal, reason } = this.calculator.processNewBar(bar, this.marketState);
-    this.logger.debug(`Signal: ${signal}, Reason: ${reason}`);
-
-    if (signal !== 'hold' && !this.positionState.isInPosition) {
-      const direction = signal === 'buy' ? 'long' : 'short';
-      await this.executeTrade(direction, bar);
+    // ---------- ENTRY (no pyramiding) ----------
+    // cooldown after a flatten
+    if (Date.now() < this.entryCooldownUntil) {
+      console.info('[MNQDeltaTrend][entry-blocked]', { reason: 'cooldown', msLeft: this.entryCooldownUntil - Date.now() });
+      return;
     }
 
-    if (this.positionState.isInPosition) {
-      this.checkExitConditions(bar).catch((err) =>
-        this.logger.error('Exit condition check failed:', err)
-      );
+    // local locks / in-flight exit / already have position
+    if (this.exitingNow || this.localOpenQty !== 0 || this.calculator.hasPosition()) {
+      console.info('[MNQDeltaTrend][entry-blocked]', {
+        reason: 'pyramiding/local-lock',
+        exitingNow: this.exitingNow,
+        localOpenQty: this.localOpenQty,
+        hasPos: this.calculator.hasPosition()
+      });
+      return;
     }
-  }
 
-  private async executeTrade(direction: 'long' | 'short', bar: BarData): Promise<void> {
+    // broker truth (defensive)
+    const netOpen = await this.client.getNetPositionSize(this.contractId);
+    if (Math.abs(netOpen) > 0) {
+      console.info('[MNQDeltaTrend][entry-blocked]', { reason: 'broker shows open qty', netOpen });
+      return;
+    }
+
+    // if somehow signal matches current dir (shouldn't happen due to guards), ignore
+    if (posDir && ((posDir === 'long' && signal.signal === 'buy') || (posDir === 'short' && signal.signal === 'sell'))) {
+      console.info('[MNQDeltaTrend][entry-ignored]', { reason: 'already in same direction', posDir });
+      return;
+    }
+
+    // place entry
+    const direction = signal.signal === 'buy' ? 'long' : 'short';
+    const atr = this.marketState.atr ?? 0;
+    const acctBal = await this.client.getEquity();
+    const qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));
+
+    console.info(`[MNQDeltaTrend][ENTRY] ${signal.signal.toUpperCase()} qty=${qty} reason="${signal.reason}"`);
+
+    // optimistic lock before sending to broker
+    this.localOpenQty = qty;
+
     try {
-      if (!this.mnqContractId) {
-        throw new Error('MNQ contract ID not available');
-      }
-
-      const balance = await this.client.getBalance();
-      const positionSize = this.calculator.calculatePositionSize(
-        bar.close,
-        this.marketState.atr,
-        balance
-      );
-
-      if (positionSize <= 0) return;
-
-      const { stopLoss, takeProfit } = this.calculator.calculateStopLossTakeProfit(
-        bar.close,
-        direction,
-        this.marketState.atr
-      );
-
-      const side = direction === 'long' ? OrderSide.Bid : OrderSide.Ask;
-      const type = OrderType.Market;
-
-      const orderId = await this.client.createOrder({
-        contractId: this.mnqContractId,
-        type,
-        side,
-        size: positionSize
+      await this.client.createOrder({
+        contractId: this.contractId,
+        type: 2,                               // Market per Topstep docs
+        side: signal.signal === 'buy' ? 0 : 1, // 0=Buy, 1=Sell
+        size: qty,
       });
 
-      this.positionState = {
-        isInPosition: true,
-        entryPrice: bar.close,
-        stopLoss,
-        takeProfit,
-        positionSize,
-        direction,
-        entryTime: Date.now()
-      };
-
-      // notify calculator about new position for trailing logic
-      this.calculator.setPosition(bar.close, direction);
-
-      this.logger.info(`Entered ${direction} position at ${bar.close}, Order ID: ${orderId}`);
-    } catch (err) {
-      this.logger.error('Failed to execute trade:', err);
-    }
-  }
-
-  private async checkExitConditions(bar: BarData): Promise<void> {
-    const { direction, stopLoss, takeProfit } = this.positionState;
-
-    if (
-      (direction === 'long' && bar.close <= stopLoss) ||
-      (direction === 'short' && bar.close >= stopLoss)
-    ) {
-      await this.closePosition('Stop loss hit');
-      return;
-    }
-
-    if (
-      (direction === 'long' && bar.close >= takeProfit) ||
-      (direction === 'short' && bar.close <= takeProfit)
-    ) {
-      await this.closePosition('Take profit hit');
-    }
-  }
-
-  private async closePosition(reason: string): Promise<void> {
-    try {
-      if (!this.mnqContractId) {
-        throw new Error('MNQ contract ID not available');
-      }
-
-      const exitPrice = this.marketState.currentPrice;
-
-      await this.client.closePosition(this.mnqContractId);
-      this.logger.info(`Closed position: ${reason}`);
-
-      const pnl = this.calculatePnL(
-        this.positionState.entryPrice,
-        exitPrice,
-        this.positionState.positionSize,
-        this.positionState.direction as 'long' | 'short'
-      );
-
-      await this.notifyTradeClosed(this.positionState.entryTime, exitPrice, pnl, reason);
-
-      this.positionState.isInPosition = false;
-      this.positionState.direction = 'none';
-
-      // reset calculator position state
-      this.calculator.clearPosition();
-    } catch (err) {
-      this.logger.error('Failed to close position:', err);
-    }
-  }
-
-  private calculatePnL(
-    entryPrice: number,
-    exitPrice: number,
-    size: number,
-    direction: 'long' | 'short'
-  ): number {
-    const diff = exitPrice - entryPrice;
-    const pnl = direction === 'long' ? diff * size : -diff * size;
-    return Number(pnl.toFixed(2));
-  }
-
-  private async handleNewPosition(position: GatewayUserPosition): Promise<void> {
-    try {
-      this.logger.info(
-        `New position update: ID ${position.id}, ${position.type === 1 ? 'Long' : 'Short'}, Size ${position.size}`
-      );
-      await this.notifyTradeOpened(position);
-    } catch (err) {
-      this.logger.error('Failed to handle new position event:', err);
-    }
-  }
-
-  private async notifyTradeOpened(position: GatewayUserPosition): Promise<void> {
-    try {
-      const tradeData = {
-        id: `pos-${position.id}`,
-        entryTime: position.creationTimestamp,
-        direction: position.type === 1 ? 'long' : 'short',
-        entryPrice: position.averagePrice,
-        exitPrice: null,
-        pnl: null,
-        reason: 'Strategy entry',
-        status: 'open',
-        contract: position.contractId,
-        quantity: position.size
-      };
-
-      await this.apiClient.post('/api/trades', tradeData);
-      this.logger.info(`Trade opened notification sent for position ${position.id}`);
-    } catch (err) {
-      this.logger.error('Failed to notify trade opening:', err);
-    }
-  }
-
-  private async notifyTradeClosed(
-    positionId: number,
-    exitPrice: number,
-    pnl: number,
-    reason: string
-  ): Promise<void> {
-    try {
-      await this.apiClient.post(`/api/trades/pos-${positionId}`, {
-        exitPrice,
-        pnl,
-        reason,
-        status: 'closed'
+      console.info('[MNQDeltaTrend][ENTRY:broker-ok]', {
+        side: signal.signal,
+        qty,
+        entryPrice: bar.close
       });
-      this.logger.info(`Trade closed notification sent for position ${positionId}`);
+
+      // seed trailing/position state
+      try { (this.calculator as any).setPosition?.(bar.close, direction, atr); } catch {}
+
     } catch (err) {
-      this.logger.error('Failed to notify trade closing:', err);
+      // release lock on failure
+      this.localOpenQty = 0;
+      console.error('[MNQDeltaTrend][ENTRY] placement failed:', err);
     }
-  }
-
-  stop(): void {
-    this.client.disconnectWebSocket();
-    this.logger.info('Strategy stopped');
-  }
-
-  getWarmUpStatus(): boolean {
-    return this.isWarmUpComplete;
-  }
-
-  getContractId(): string | null {
-    return this.mnqContractId;
   }
 }
-
-
-// // src/strategies/mnq-delta-trend/trader.ts
-
-// import { ProjectXClient } from '../../services/projectx-client';
-// import { ApiClient } from '../../services/api-client';
-// import { MarketDataService } from '../../services/market-data.service';
-// import { MNQDeltaTrendCalculator } from './calculator';
-// import { StrategyConfig, PositionState, MarketState, BarData } from './types';
-// import { Logger } from '../../utils/logger';
-// import {
-//   GatewayQuote,
-//   OrderSide,
-//   OrderType,
-//   GatewayUserPosition
-// } from '../../types';
-
-// export class MNQDeltaTrendTrader {
-//   private client: ProjectXClient;
-//   private marketDataService: MarketDataService;
-//   private calculator: MNQDeltaTrendCalculator;
-//   private config: StrategyConfig;
-//   private positionState: PositionState;
-//   private marketState: MarketState;
-//   private isTradingHours = false;
-//   private isWarmUpComplete = false;
-//   private logger: Logger;
-//   private mnqContractId: string | null = null;
-//   private apiClient: ApiClient;
-
-//   // --- de-dupe guard for repeated market data frames ---
-//   private lastTickSig: string | null = null;
-//   private lastTickAt: number = 0;
-//   private static readonly DEDUPE_MS = 300; // ignore identical frames within this window
-
-//   constructor(client: ProjectXClient, baseURL: string, config: StrategyConfig) {
-//     this.client = client;
-//     this.apiClient = new ApiClient(baseURL);
-//     this.marketDataService = new MarketDataService(client);
-//     this.config = config;
-//     this.calculator = new MNQDeltaTrendCalculator(config);
-//     this.logger = new Logger('MNQDeltaTrend');
-
-//     this.positionState = {
-//       isInPosition: false,
-//       entryPrice: 0,
-//       stopLoss: 0,
-//       takeProfit: 0,
-//       positionSize: 0,
-//       direction: 'none',
-//       entryTime: 0
-//     };
-
-//     this.marketState = {
-//       currentPrice: 0,
-//       atr: 0,
-//       higherTimeframeTrend: 'neutral',
-//       deltaCumulative: 0,
-//       previousBars: []
-//     };
-
-//     this.setupEventListeners();
-//   }
-
-//   // relaxed match helper for either symbol or contractId
-//   private matchesSymbolOrContract(q: { symbol?: string; contractId?: string }): boolean {
-//     const feedSym = q.symbol ?? '';
-//     const want = this.config.symbol;
-//     const symOk = feedSym === want || feedSym.endsWith(want);
-//     const cidOk = this.mnqContractId ? q.contractId === this.mnqContractId : false;
-//     return symOk || cidOk;
-//   }
-
-//   async start(): Promise<void> {
-//     this.logger.info('Starting MNQ Delta Trend Strategy');
-
-//     // 1) Warm-up using historical bars
-//     await this.initializeWarmUpData();
-
-//     // 2) Connect realtime + subscribe (by SYMBOL — matches ProjectXClient API)
-//     await this.client.connectWebSocket();
-//     await this.client.subscribeToSymbols([this.config.symbol]);
-//   }
-
-//   private async initializeWarmUpData(): Promise<void> {
-//     try {
-//       this.logger.info('Fetching historical data for strategy warm-up...');
-
-//       // Search MNQ contracts
-//       const contracts = await this.client.searchContracts('MNQ');
-//       if (contracts.length === 0) {
-//         throw new Error('No MNQ contracts found');
-//       }
-
-//       this.logger.info(`Found ${contracts.length} MNQ contracts:`);
-//       contracts.forEach((c, i) => {
-//         this.logger.info(
-//           `  ${i + 1}. ${c.name} - ${c.description} (Active: ${c.activeContract})`
-//         );
-//       });
-
-//       // Pick most current active MNQ
-//       const activeMNQ = contracts.filter(
-//         (c) => c.activeContract && (c.symbolId.includes('MNQ') || c.name.includes('MNQ'))
-//       );
-//       if (activeMNQ.length === 0) {
-//         throw new Error('No active MNQ contracts found');
-//       }
-
-//       const mostCurrent = activeMNQ.sort((a, b) => b.name.localeCompare(a.name))[0];
-//       this.mnqContractId = mostCurrent.id;
-//       this.logger.info(`✅ Selected most current MNQ contract: ${mostCurrent.name} - ${mostCurrent.description}`);
-
-//       // // Pull warm-up bars
-//       // const [bars15, bars3] = await Promise.all([
-//       //   this.marketDataService.fetchWarmUpData15min(this.mnqContractId, this.config),
-//       //   this.marketDataService.fetchWarmUpData3min(this.mnqContractId, this.config)
-//       // ]);
-//       // Pull warm-up bars
-//       const warmupCfg = this.buildWarmupConfig();
-//       const [bars15, bars3] = await Promise.all([
-//         this.marketDataService.fetchWarmUpData15min(this.mnqContractId, warmupCfg),
-//         this.marketDataService.fetchWarmUpData3min(this.mnqContractId, warmupCfg)
-//       ]);
-
-//       bars15.forEach((bar) => this.calculator.processWarmUpBar(bar, '15min'));
-//       bars3.forEach((bar) => this.calculator.processWarmUpBar(bar, '3min'));
-
-//       this.calculator.completeWarmUp();
-//       this.isWarmUpComplete = true;
-
-//       this.logger.info(`✅ Warm-up complete: ${bars15.length}15min bars, ${bars3.length}3min bars`);
-//     } catch (err) {
-//       this.logger.error('Warm-up initialization failed:', err);
-//       throw err;
-//     }
-//   }
-
-//   private setupEventListeners(): void {
-//     // Real-time market data (quotes)
-//     this.client.onMarketData((raw: GatewayQuote & { contractId?: string; timestamp?: string | number }) => {
-//       const data = raw as GatewayQuote & { contractId?: string; timestamp?: string | number };
-
-//       // gate by symbol or contract
-//       if (!this.matchesSymbolOrContract({ symbol: (data as any).symbol, contractId: data.contractId as any })) return;
-
-//       // normalize lastPrice if missing
-//       if (typeof data.lastPrice !== 'number' || Number.isNaN(data.lastPrice)) {
-//         const p = (data as any).tradePrice ?? (data as any).close ?? (data as any).mark;
-//         const bid = (data as any).bid;
-//         const ask = (data as any).ask;
-//         const mid = (typeof bid === 'number' && typeof ask === 'number') ? (bid + ask) / 2 : undefined;
-//         if (typeof p === 'number') (data as any).lastPrice = p;
-//         else if (typeof mid === 'number') (data as any).lastPrice = mid;
-//       }
-
-//       // throttle "incomplete" spam logs
-//       if (typeof data.lastPrice !== 'number' || Number.isNaN(data.lastPrice)) {
-//         const now = Date.now();
-//         if (now - this.lastTickAt > 1000) {
-//           this.logger.debug(`Skipping incomplete quote for ${(data as any).symbol ?? 'N/A'}`);
-//           this.lastTickAt = now;
-//         }
-//         return;
-//       }
-
-//       // de-dupe identical frames in a short window
-//       const ts = typeof data.timestamp === 'number'
-//         ? data.timestamp
-//         : (data.timestamp ? Date.parse(data.timestamp as string) : Date.now());
-
-//       const deltaVal = (data as any).change ?? (data as any).delta ?? 'NA';
-//       const sig = `${data.contractId ?? ''}|${(data as any).symbol ?? ''}|${data.lastPrice}|${deltaVal}|${Math.floor(ts / 1000)}`;
-
-//       const nowMs = Date.now();
-//       if (this.lastTickSig === sig && (nowMs - this.lastTickAt) < MNQDeltaTrendTrader.DEDUPE_MS) {
-//         return; // drop duplicate tick
-//       }
-//       this.lastTickSig = sig;
-//       this.lastTickAt = nowMs;
-
-//       // proceed to strategy pipeline
-//       this.processQuote(data as GatewayQuote & { contractId: string });
-//     });
-
-//     // User order/position updates
-//     this.client.onOrderUpdate((order) => {
-//       this.logger.info(`Order update: ${order.status}`);
-//     });
-
-//     this.client.onPositionUpdate((position: GatewayUserPosition) => {
-//       if (this.mnqContractId && position.contractId === this.mnqContractId) {
-//         this.handleNewPosition(position);
-//       }
-//     });
-
-//     this.client.onConnected(() => {
-//       this.logger.info('Real-time data connected - strategy ready');
-//     });
-//   }
-
-//   private processQuote(data: GatewayQuote & { contractId: string }): void {
-//     // Single, consistent debug line
-//     this.logger.debug(
-//       `Tick ${(data as any).symbol ?? 'N/A'} @ ${data.lastPrice} Δ:${(data as any).change ?? 'n/a'}`
-//     );
-
-//     if (!this.isWarmUpComplete) {
-//       this.logger.debug('Signal: hold, Reason: Warm-up in progress');
-//       return;
-//     }
-
-//     // Update market state
-//     this.marketState.currentPrice = data.lastPrice;
-
-//     // Respect trading window
-//     this.isTradingHours = this.marketDataService.isWithinTradingHours(
-//       this.config.tradingStartTime,
-//       this.config.tradingEndTime
-//     );
-//     if (!this.isTradingHours) {
-//       if (this.positionState.isInPosition) {
-//         // flatten if outside trading hours
-//         this.closePosition('Outside trading hours').catch((err) =>
-//           this.logger.error('Close position error (outside hours):', err)
-//         );
-//       }
-//       return;
-//     }
-
-//     // Build a 1-tick bar and process
-//     const bar = this.createBarFromQuote(data);
-//     this.processNewBar(bar).catch((err) =>
-//       this.logger.error('Error processing new bar:', err)
-//     );
-//   }
-
-//   private createBarFromQuote(quote: GatewayQuote): BarData {
-//     return {
-//       timestamp: new Date().toISOString(),
-//       open: quote.lastPrice,
-//       high: quote.lastPrice,
-//       low: quote.lastPrice,
-//       close: quote.lastPrice,
-//       volume: typeof (quote as any).volume === 'number' ? (quote as any).volume : 0,
-//       delta: typeof (quote as any).change === 'number' ? (quote as any).change : 0
-//     };
-//   }
-
-
-//   private buildWarmupConfig() {
-//     return {
-//       atrPeriod: 14,                                         // standard ATR lookback (leave as-is unless you want to tune)
-//       deltaSmaPeriod: this.config.deltaSMALength,            // from StrategyConfig
-//       breakoutLookback: this.config.breakoutLookbackBars,    // from StrategyConfig
-//       higherTimeframeWindow: 5,                              // matches our HTF window usage
-//       tradingStartTime: this.config.tradingStartTime,        // REQUIRED by WarmupConfig
-//       tradingEndTime: this.config.tradingEndTime             // REQUIRED by WarmupConfig
-//     };
-//   }
-
-
-//   private async processNewBar(bar: BarData): Promise<void> {
-//     // Trace newly constructed bar once (no duplicates)
-//     this.logger.debug(
-//       `New bar: ${bar.timestamp} O:${bar.open} H:${bar.high} L:${bar.low} C:${bar.close}`
-//     );
-
-//     const { signal, reason } = this.calculator.processNewBar(bar, this.marketState);
-//     this.logger.debug(`Signal: ${signal}, Reason: ${reason}`);
-
-//     if (signal !== 'hold' && !this.positionState.isInPosition) {
-//       const direction = signal === 'buy' ? 'long' : 'short';
-//       await this.executeTrade(direction, bar);
-//     }
-
-//     if (this.positionState.isInPosition) {
-//       this.checkExitConditions(bar).catch((err) =>
-//         this.logger.error('Exit condition check failed:', err)
-//       );
-//     }
-//   }
-
-//   private async executeTrade(direction: 'long' | 'short', bar: BarData): Promise<void> {
-//     try {
-//       if (!this.mnqContractId) {
-//         throw new Error('MNQ contract ID not available');
-//       }
-
-//       const balance = await this.client.getBalance();
-//       const positionSize = this.calculator.calculatePositionSize(
-//         bar.close,
-//         this.marketState.atr,
-//         balance
-//       );
-
-//       if (positionSize <= 0) return;
-
-//       const { stopLoss, takeProfit } = this.calculator.calculateStopLossTakeProfit(
-//         bar.close,
-//         direction,
-//         this.marketState.atr
-//       );
-
-//       const side = direction === 'long' ? OrderSide.Bid : OrderSide.Ask;
-//       const type = OrderType.Market;
-
-//       const orderId = await this.client.createOrder({
-//         contractId: this.mnqContractId,
-//         type,
-//         side,
-//         size: positionSize
-//       });
-
-//       this.positionState = {
-//         isInPosition: true,
-//         entryPrice: bar.close,
-//         stopLoss,
-//         takeProfit,
-//         positionSize,
-//         direction,
-//         entryTime: Date.now()
-//       };
-
-//       // notify calculator about new position for trailing logic
-//       this.calculator.setPosition(bar.close, direction);
-
-//       this.logger.info(`Entered ${direction} position at ${bar.close}, Order ID: ${orderId}`);
-//     } catch (err) {
-//       this.logger.error('Failed to execute trade:', err);
-//     }
-//   }
-
-//   private async checkExitConditions(bar: BarData): Promise<void> {
-//     const { direction, stopLoss, takeProfit } = this.positionState;
-
-//     if (
-//       (direction === 'long' && bar.close <= stopLoss) ||
-//       (direction === 'short' && bar.close >= stopLoss)
-//     ) {
-//       await this.closePosition('Stop loss hit');
-//       return;
-//     }
-
-//     if (
-//       (direction === 'long' && bar.close >= takeProfit) ||
-//       (direction === 'short' && bar.close <= takeProfit)
-//     ) {
-//       await this.closePosition('Take profit hit');
-//     }
-//   }
-
-//   private async closePosition(reason: string): Promise<void> {
-//     try {
-//       if (!this.mnqContractId) {
-//         throw new Error('MNQ contract ID not available');
-//       }
-
-//       const exitPrice = this.marketState.currentPrice;
-
-//       await this.client.closePosition(this.mnqContractId);
-//       this.logger.info(`Closed position: ${reason}`);
-
-//       const pnl = this.calculatePnL(
-//         this.positionState.entryPrice,
-//         exitPrice,
-//         this.positionState.positionSize,
-//         this.positionState.direction as 'long' | 'short'
-//       );
-
-//       await this.notifyTradeClosed(this.positionState.entryTime, exitPrice, pnl, reason);
-
-//       this.positionState.isInPosition = false;
-//       this.positionState.direction = 'none';
-
-//       // reset calculator position state
-//       this.calculator.clearPosition();
-//     } catch (err) {
-//       this.logger.error('Failed to close position:', err);
-//     }
-//   }
-
-//   private calculatePnL(
-//     entryPrice: number,
-//     exitPrice: number,
-//     size: number,
-//     direction: 'long' | 'short'
-//   ): number {
-//     const diff = exitPrice - entryPrice;
-//     const pnl = direction === 'long' ? diff * size : -diff * size;
-//     return Number(pnl.toFixed(2));
-//   }
-
-//   private async handleNewPosition(position: GatewayUserPosition): Promise<void> {
-//     try {
-//       this.logger.info(
-//         `New position update: ID ${position.id}, ${position.type === 1 ? 'Long' : 'Short'}, Size ${position.size}`
-//       );
-//       await this.notifyTradeOpened(position);
-//     } catch (err) {
-//       this.logger.error('Failed to handle new position event:', err);
-//     }
-//   }
-
-//   private async notifyTradeOpened(position: GatewayUserPosition): Promise<void> {
-//     try {
-//       const tradeData = {
-//         id: `pos-${position.id}`,
-//         entryTime: position.creationTimestamp,
-//         direction: position.type === 1 ? 'long' : 'short',
-//         entryPrice: position.averagePrice,
-//         exitPrice: null,
-//         pnl: null,
-//         reason: 'Strategy entry',
-//         status: 'open',
-//         contract: position.contractId,
-//         quantity: position.size
-//       };
-
-//       await this.apiClient.post('/api/trades', tradeData);
-//       this.logger.info(`Trade opened notification sent for position ${position.id}`);
-//     } catch (err) {
-//       this.logger.error('Failed to notify trade opening:', err);
-//     }
-//   }
-
-//   private async notifyTradeClosed(
-//     positionId: number,
-//     exitPrice: number,
-//     pnl: number,
-//     reason: string
-//   ): Promise<void> {
-//     try {
-//       await this.apiClient.post(`/api/trades/pos-${positionId}`, {
-//         exitPrice,
-//         pnl,
-//         reason,
-//         status: 'closed'
-//       });
-//       this.logger.info(`Trade closed notification sent for position ${positionId}`);
-//     } catch (err) {
-//       this.logger.error('Failed to notify trade closing:', err);
-//     }
-//   }
-
-//   stop(): void {
-//     this.client.disconnectWebSocket();
-//     this.logger.info('Strategy stopped');
-//   }
-
-//   getWarmUpStatus(): boolean {
-//     return this.isWarmUpComplete;
-//   }
-
-//   getContractId(): string | null {
-//     return this.mnqContractId;
-//   }
-// }

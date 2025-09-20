@@ -115,26 +115,52 @@ export class ApiService {
   async placeOrder(request: {
     accountId: number;
     contractId: string;
-    type: number;
-    side: number;
+    type: number;      // your enum (1=Market, 2=Limit, etc.)
+    side: number;      // ✅ Topstep expects 0=Bid(Buy), 1=Ask(Sell)
     size: number;
     limitPrice?: number;
     stopPrice?: number;
     trailPrice?: number;
-    customTag?: string;
     linkedOrderId?: number;
   }): Promise<OrderPlaceResponse> {
+    // ---- Normalize & validate ----
+    const body = { ...request };
+
+
+    if (body.side !== 0 && body.side !== 1) {
+      throw new Error(`Order placement failed: side must be 0 (Buy) or 1 (Sell), got ${body.side}`);
+    }
+
+    // Ensure numeric size
+    body.size = Math.max(1, Math.floor(Number(body.size) || 0));
+
+    // WITH this (Topstep enums: 1=Limit, 2=Market, 4=Stop, 5=TrailingStop, 6=JoinBid, 7=JoinAsk):
+    if (![1, 2, 4, 5, 6, 7].includes(body.type)) {
+      throw new Error(`Order placement failed: unsupported type enum ${body.type}`);
+    }
+
+    // Trace (no secrets)
+    console.log('[order->broker]', {
+      accountId: body.accountId,
+      contractId: body.contractId,
+      type: body.type,
+      side: body.side,
+      size: body.size,
+      limitPrice: body.limitPrice,
+      stopPrice: body.stopPrice,
+    });
+
     try {
-      const response = await this.apiClient.authPost<OrderPlaceResponse>('/api/Order/place', request);
-      if (!response.success) {
-        throw new Error(`Order placement failed: ${response.errorMessage}`);
-      }
-      return response;
-    } catch (error) {
-      throw new Error(`Order placement failed: ${error instanceof Error ? error.message : String(error)}`);
+      const res = await this.apiClient.authPost<OrderPlaceResponse>('/api/Order/place', body);
+      if (!res.success) throw new Error(res.errorMessage || 'Unknown broker error');
+      return res;
+    } catch (err: any) {
+      const msg = (err?.response?.data ?? err?.message ?? '').toString();
+      console.error('[order<-broker][error]', err?.response?.status ?? '', msg);
+      throw new Error(`Order placement failed: ${msg}`);
     }
   }
-
+  
   async cancelOrder(request: { accountId: number; orderId: number }): Promise<ApiResponseBase> {
     try {
       const response = await this.apiClient.authPost<ApiResponseBase>('/api/Order/cancel', request);
@@ -168,6 +194,18 @@ export class ApiService {
       return response;
     } catch (error) {
       throw new Error(`Position close failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+    async partialClosePosition(request: { accountId: number; contractId: string; size: number }): Promise<ApiResponseBase> {
+    try {
+      const response = await this.apiClient.authPost<ApiResponseBase>('/api/Position/partialCloseContract', request);
+      if (!response.success) {
+        throw new Error(`Partial position close failed: ${response.errorMessage}`);
+      }
+      return response;
+    } catch (error) {
+      throw new Error(`Partial position close failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

@@ -7,11 +7,11 @@ import tradesRouter from './routes/trades';
 import strategyRouter from './routes/strategy';
 
 const app = express();
-const PORT = 3001;
+const PORT = 4001;
 
 // Middleware
 app.use(cors({
-  origin: 'http://localhost:3000', // React app will run here
+  origin: 'http://localhost:4000', // React app will run here
   credentials: true
 }));
 app.use(helmet());

@@ -9,9 +9,9 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   tradingEndTime:   '15:55',
 
   // === DELTA CONFIGURATION (force easy entry) ===
-  deltaSMALength: 20,           
-  deltaSpikeThreshold: 550,    
-  deltaSurgeMultiplier: 1.7,   
+  deltaSMALength: 15,           
+  deltaSpikeThreshold: 450,    
+  deltaSurgeMultiplier: 1.1,   
   breakoutLookbackBars: 30,    
   deltaSlopeExitLength: 3,     
 
@@ -20,12 +20,12 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   useEmaFilter: true,       
   htfEMALength: 21,
   higherTimeframe: 15,
-  htfUseForming: false,
+  htfUseForming: true,
 
   // === ATR & EXIT CONFIGURATION ===
   atrProfitMultiplier: 1.0,    
   atrStopLossMultiplier: 1.2,  //0.3-0.5
-  minAtrToTrade: 13,        
+  minAtrToTrade: 12,        
   minBarsBeforeExit: 1,
 
   // === TRAILING STOP CONFIGURATION ===
@@ -40,7 +40,7 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   maxDailyDrawdown: 2500,
 
     // === TRAILING STOP CONFIGURATION ===
-  trailActivationATR: 0.15,
+  trailActivationATR: 0.3,
   trailOffsetATR: 0.125,
 
   "requireDelta": true,                // set true only if you MUST have true delta from feed

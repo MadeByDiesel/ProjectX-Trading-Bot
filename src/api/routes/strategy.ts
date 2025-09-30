@@ -150,20 +150,6 @@ router.post('/start', async (req: Request, res: Response) => {
     // Build calculator with Pine-parity config
     const calculator = new MNQDeltaTrendCalculator(MNQ_DELTA_TREND_CONFIG);
 
-    // // ---------- WARM-UP (history → calculator) ----------
-    // // 1) Fetch history (minutes as strings, per your ProjectXClient.getBars)
-    // const bars3m = await client.getBars(contractId, '3', 300);   // 3-minute bars
-    // const htfMinutes = String(MNQ_DELTA_TREND_CONFIG.higherTimeframe ?? 15);
-    // const barsHTF = await client.getBars(contractId, htfMinutes, 300); // e.g., 15-minute bars
-
-    // // 2) Feed warm-up in timestamp order
-    // for (const b of bars3m)  calculator.processWarmUpBar(b, '3min');
-    // for (const b of barsHTF) calculator.processWarmUpBar(b, 'HTF');
-
-    // // 3) Seal warm-up
-    // calculator.completeWarmUp();
-    // logger.info(`[WarmUp] 3m=${bars3m.length} HTF(${htfMinutes}m)=${barsHTF.length}`);
-
     // ---------- WARM-UP (history → calculator) ----------
     const bars3mRaw = await client.getBars(contractId, '3', 300);
     const htfMinutes = String(MNQ_DELTA_TREND_CONFIG.higherTimeframe ?? 15);

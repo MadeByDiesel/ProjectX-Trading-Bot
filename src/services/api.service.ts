@@ -126,7 +126,6 @@ export class ApiService {
     // ---- Normalize & validate ----
     const body = { ...request };
 
-
     if (body.side !== 0 && body.side !== 1) {
       throw new Error(`Order placement failed: side must be 0 (Buy) or 1 (Sell), got ${body.side}`);
     }
@@ -155,9 +154,11 @@ export class ApiService {
       if (!res.success) throw new Error(res.errorMessage || 'Unknown broker error');
       return res;
     } catch (err: any) {
-      const msg = (err?.response?.data ?? err?.message ?? '').toString();
-      console.error('[order<-broker][error]', err?.response?.status ?? '', msg);
-      throw new Error(`Order placement failed: ${msg}`);
+      const status = err?.response?.status;
+      const data   = err?.response?.data;
+      const msg    = (data?.errorMessage || data?.message || err?.message || 'Unknown error').toString();
+      console.error('[order<-broker][error]', status ?? '', JSON.stringify(data ?? {}, null, 2));
+      throw new Error(`Order placement failed: HTTP ${status ?? '??'} – ${msg}`);
     }
   }
   
@@ -186,18 +187,37 @@ export class ApiService {
   }
 
   async closePosition(request: { accountId: number; contractId: string }): Promise<ApiResponseBase> {
+    const { accountId, contractId } = request;
+
+    // 1) Pre-check: if no open position on this contract, return success (idempotent close)
     try {
-      const response = await this.apiClient.authPost<ApiResponseBase>('/api/Position/closeContract', request);
+      const open = await this.searchOpenPositions({ accountId });
+      const pos = (open?.positions ?? []).find(p => p.contractId === contractId);
+      if (!pos || !pos.size || pos.size === 0) {
+        console.warn('[closePosition] already flat; skipping broker call', { accountId, contractId });
+        return { success: true, errorCode: 0, errorMessage: '' };
+      }
+    } catch (preErr) {
+      console.warn('[closePosition] pre-check failed, attempting broker close', { accountId, contractId, preErr: (preErr as Error)?.message });
+    }
+
+    // 2) Perform broker close
+    try {
+      const response = await this.apiClient.authPost<ApiResponseBase>('/api/Position/closeContract', { accountId, contractId });
       if (!response.success) {
-        throw new Error(`Position close failed: ${response.errorMessage}`);
+        throw new Error(response.errorMessage || 'Unknown broker error on closeContract');
       }
       return response;
-    } catch (error) {
-      throw new Error(`Position close failed: ${error instanceof Error ? error.message : String(error)}`);
+    } catch (error: any) {
+      const status = error?.response?.status;
+      const data   = error?.response?.data;
+      const msg    = (data?.errorMessage || data?.message || error?.message || 'Unknown error').toString();
+      console.error('[closePosition<-broker][error]', status ?? '', JSON.stringify(data ?? {}, null, 2));
+      throw new Error(`Position close failed: HTTP ${status ?? '??'} – ${msg}`);
     }
   }
 
-    async partialClosePosition(request: { accountId: number; contractId: string; size: number }): Promise<ApiResponseBase> {
+  async partialClosePosition(request: { accountId: number; contractId: string; size: number }): Promise<ApiResponseBase> {
     try {
       const response = await this.apiClient.authPost<ApiResponseBase>('/api/Position/partialCloseContract', request);
       if (!response.success) {

@@ -7,7 +7,7 @@ import { GatewayQuote, BarData } from '../../types'; // SignalR types come from 
 export class MNQDeltaTrendTrader {
   private client: ProjectXClient;
   private calculator: MNQDeltaTrendCalculator;
-  private readonly config: StrategyConfig;  
+  private config: StrategyConfig;
 
   private contractId: string;
   private symbol: string;
@@ -27,12 +27,8 @@ export class MNQDeltaTrendTrader {
 
   private running = false;
   private heartbeat: NodeJS.Timeout | null = null;
-  // Pyramiding / race guards
-  private exitingNow = false;         // already in your file if you added earlier
-  private localOpenQty = 0;           // optimistic local net qty (blocks new entries)
-  private entryCooldownUntil = 0;     // ms timestamp to delay re-entry after a flatten
-  private sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
-  
+  private isFlattening = false;
+
   // Minimal market state; calculator maintains ATR/HTF internally after warm-up
   private marketState = {
     atr: 0,
@@ -55,8 +51,6 @@ export class MNQDeltaTrendTrader {
     this.config = opts.config;
     this.contractId = opts.contractId;
     this.symbol = opts.symbol;
-
-    console.info('[MNQDeltaTrend][Config:Trader]', this.config);
   }
 
   /** Call once to start streaming. */
@@ -78,19 +72,6 @@ export class MNQDeltaTrendTrader {
     }, 1000);
 
     console.info(`[MNQDeltaTrend][Trader] started for ${this.symbol} (contractId=${this.contractId})`);
-
-    // Log the *exact* effective config the calculator will trade with
-    const eff = this.calculator.getConfig()
-    console.info('[MNQDeltaTrend][CONFIG:start]', {
-      hash: (eff ? (/* reuse same hash impl here or inline: */ 
-        (() => {
-          const s = JSON.stringify(eff, Object.keys(eff).sort());
-          let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
-          return (h >>> 0).toString(16).padStart(8, '0');
-        })()
-      ) : '----'),
-      effective: eff
-    });
   }
 
   /** Optional: stop receiving data & clear timers. Safe to call multiple times. */
@@ -106,7 +87,7 @@ export class MNQDeltaTrendTrader {
     console.info('[MNQDeltaTrend][Trader] stopped');
   }
 
-  private async onQuote(quote: GatewayQuote & { contractId: string }): Promise<void> {
+  private onQuote(quote: GatewayQuote & { contractId: string }): void {
     if (!this.running) return;
     if (quote.contractId !== this.contractId) return;
 
@@ -114,66 +95,9 @@ export class MNQDeltaTrendTrader {
     const px = quote.lastPrice;
     if (!Number.isFinite(px)) return;
 
-    // Reconcile: calc says flat but we hold a local lock → sync with broker
-    if (!this.calculator.hasPosition() && this.localOpenQty > 0 && !this.exitingNow) {
-      try {
-        const net = await this.client.getNetPositionSize(this.contractId);
-        if (Math.abs(net) === 0) {
-          // Do NOT unlock on an unconfirmed “flat” snapshot (polls can lag/429).
-          console.warn('[MNQDeltaTrend][RECONCILE] broker reports flat (unconfirmed); keeping local lock');
-          // no-op: keep this.localOpenQty as-is
-        } else {
-          // Broker shows open qty → flatten now with one-shot flatten API
-          console.warn('[MNQDeltaTrend][RECONCILE] broker shows open qty; flattening', { net });
-          this.exitingNow = true;
-          try {
-            await this.client.closePosition(this.contractId);
-            this.localOpenQty = 0;
-          } finally {
-            this.exitingNow = false;
-          }
-        }
-      } catch (e) {
-        console.error('[MNQDeltaTrend][RECONCILE] failed:', e as any);
-        // keep lock on error
-      }
-    }
-
-    // ---- Intrabar protective stop / trailing stop check (tick-level) ----
-    if (this.calculator.hasPosition()) {
-      const hit = this.calculator.onTickForProtectiveStops(px, this.marketState.atr ?? NaN);
-      if (hit === 'hitStop' || hit === 'hitTrail') {
-        console.info(
-          '[MNQDeltaTrend][EXIT]',
-          hit === 'hitStop' ? 'stop hit (tick)' : 'trail hit (tick)',
-          {
-            px,
-            stop:  (this as any).calculator?.['currentPosition']?.stopLoss,
-            trail: (this as any).calculator?.['trailingStopLevel']
-          }
-        );
-
-        // Robust flatten: single broker flatten; avoid quantity loops/spam
-        this.exitingNow = true;
-        try {
-          await this.client.closePosition(this.contractId);   // one-shot flatten
-          console.info('[MNQDeltaTrend][EXIT] flattened via closePosition');
-          // Clear calc & local locks, add brief cooldown
-          this.calculator.clearPosition();
-          this.localOpenQty = 0;
-          const cdMs = (this.config as any)?.entryCooldownMs ?? 8000;
-          this.entryCooldownUntil = Date.now() + cdMs;
-        } catch (err) {
-          console.error('[MNQDeltaTrend][EXIT] flatten failed:', err as any);
-          // keep lock; cooldown briefly to prevent re-entry churn after failure
-          this.entryCooldownUntil = Date.now() + 10000;
-        } finally {
-          this.exitingNow = false;
-        }
-
-        // Don’t use this tick for bar building after exit
-        return;
-      }
+    // First quote log (once)
+    if (!this.lastPriceByContract.has(contractId)) {
+      console.debug(`[MNQDeltaTrend][onQuote:first] ${this.symbol} px=${px}, vol=${quote.volume}`);
     }
 
     // ---------- accumulate per-tick volume & signed volume ----------
@@ -204,6 +128,31 @@ export class MNQDeltaTrendTrader {
     this.lastPriceByContract.set(contractId, px);
     this.lastCumVolByContract.set(contractId, cumVol);
 
+        // ---------- tick-level protective exits (stop/trail) ----------
+    if (this.calculator.hasPosition() && !this.isFlattening) {
+      const hit = this.calculator.onTickForProtectiveStops(px, this.marketState.atr ?? 0);
+      if (hit === 'hitStop' || hit === 'hitTrail') {
+        const dir = this.calculator.getPositionDirection();
+        console.info(
+          `[MNQDeltaTrend][EXIT] ${hit} (tick) { px: ${px}, atr: ${this.marketState.atr}, dir: ${dir} }`
+        );
+
+        this.isFlattening = true;
+        // Fire-and-forget close to avoid making onQuote async
+        this.client.closePosition(this.contractId)
+          .then(() => {
+            console.info('[MNQDeltaTrend][EXIT] flattened via closePosition');
+            this.calculator.clearPosition();
+            this.isFlattening = false;
+          })
+          .catch((err) => {
+            console.error('[MNQDeltaTrend][EXIT] flatten failed:', err);
+            // allow retry on next tick
+            this.isFlattening = false;
+          });
+      }
+    }
+
     // ---------- 3-minute bar bucketing ----------
     const nowMs = Date.now();
     const bucketStart = Math.floor(nowMs / this.barStepMs) * this.barStepMs;
@@ -231,7 +180,7 @@ export class MNQDeltaTrendTrader {
 
     // update current open bar extremes
     if (this.barHighPx !== null) this.barHighPx = Math.max(this.barHighPx, px);
-    if (this.barLowPx !== null)  this.barLowPx  = Math.min(this.barLowPx,  px);
+    if (this.barLowPx !== null) this.barLowPx = Math.min(this.barLowPx, px);
   }
 
   /** Heartbeat: if the wall-clock bucket advanced but we haven’t seen a tick yet, close bar anyway */
@@ -303,95 +252,50 @@ export class MNQDeltaTrendTrader {
     signal: { signal: 'buy' | 'sell' | 'hold'; reason: string; confidence: number },
     bar: BarData
   ) {
-    if (signal.signal === 'hold') return;
-
-    const posDir = this.calculator.getPositionDirection();
-    const isExitOfLong  = posDir === 'long'  && signal.signal === 'sell';
-    const isExitOfShort = posDir === 'short' && signal.signal === 'buy';
-
-    // ---------- EXIT (flatten, do not reverse) ----------
-    if (isExitOfLong || isExitOfShort) {
-      console.info('[MNQDeltaTrend][EXIT] flattening', { posDir, reason: signal.reason });
-      this.exitingNow = true;
-      try {
-        await this.client.closePosition(this.contractId);   // one-shot flatten
-        this.calculator.clearPosition();
-        this.localOpenQty = 0;
-        const cdMs = (this.config as any)?.entryCooldownMs ?? 8000;
-        this.entryCooldownUntil = Date.now() + cdMs;
-      } catch (err) {
-        console.error('[MNQDeltaTrend][EXIT] flatten failed:', err as any);
-        // keep lock; cooldown to prevent immediate churn
-        this.entryCooldownUntil = Date.now() + 10000;
-      } finally {
-        this.exitingNow = false;
+    // Respect calculator's hold — never place orders on HOLD
+    if (signal.signal === 'hold') {
+      console.debug('[MNQDeltaTrend][order] HOLD:', signal.reason);
+      return;
+    }
+    // Do not add to position (no pyramiding)
+    if (this.calculator.hasPosition()) {
+      if (signal.signal === 'buy' || signal.signal === 'sell') {
+        console.debug('[MNQDeltaTrend][order] skipped: already in position');
+        return;
       }
+    }
+    // Enforce ATR gate at the trader layer (prevents sub-threshold entries)
+    const minAtr = Math.max(0, this.config.minAtrToTrade ?? 0);
+    const atrNow = this.marketState.atr ?? 0;
+    if (!Number.isFinite(atrNow) || atrNow < minAtr) {
+      console.debug(
+        `[MNQDeltaTrend][order] blocked: ATR gate failed (atr=${atrNow}, thresh=${minAtr})`
+      );
       return;
     }
-
-    // ---------- ENTRY (no pyramiding) ----------
-    // cooldown after a flatten
-    if (Date.now() < this.entryCooldownUntil) {
-      console.info('[MNQDeltaTrend][entry-blocked]', { reason: 'cooldown', msLeft: this.entryCooldownUntil - Date.now() });
-      return;
-    }
-
-    // local locks / in-flight exit / already have position
-    if (this.exitingNow || this.localOpenQty !== 0 || this.calculator.hasPosition()) {
-      console.info('[MNQDeltaTrend][entry-blocked]', {
-        reason: 'pyramiding/local-lock',
-        exitingNow: this.exitingNow,
-        localOpenQty: this.localOpenQty,
-        hasPos: this.calculator.hasPosition()
-      });
-      return;
-    }
-
-    // broker truth (defensive)
-    const netOpen = await this.client.getNetPositionSize(this.contractId);
-    if (Math.abs(netOpen) > 0) {
-      console.info('[MNQDeltaTrend][entry-blocked]', { reason: 'broker shows open qty', netOpen });
-      return;
-    }
-
-    // if somehow signal matches current dir (shouldn't happen due to guards), ignore
-    if (posDir && ((posDir === 'long' && signal.signal === 'buy') || (posDir === 'short' && signal.signal === 'sell'))) {
-      console.info('[MNQDeltaTrend][entry-ignored]', { reason: 'already in same direction', posDir });
-      return;
-    }
-
-    // place entry
     const direction = signal.signal === 'buy' ? 'long' : 'short';
     const atr = this.marketState.atr ?? 0;
     const acctBal = await this.client.getEquity();
     const qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));
 
-    console.info(`[MNQDeltaTrend][ENTRY] ${signal.signal.toUpperCase()} qty=${qty} reason="${signal.reason}"`);
-
-    // optimistic lock before sending to broker
-    this.localOpenQty = qty;
+    console.info(`[MNQDeltaTrend][order] ${signal.signal.toUpperCase()} qty=${qty} reason="${signal.reason}"`);
 
     try {
       await this.client.createOrder({
         contractId: this.contractId,
-        type: 2,                               // Market per Topstep docs
-        side: signal.signal === 'buy' ? 0 : 1, // 0=Buy, 1=Sell
+        type: 2, // Market (Topstep: 2=Market)
+        side: signal.signal === 'buy' ? 0 : 1, // Topstep: 0=Buy(Bid), 1=Sell(Ask)
         size: qty,
       });
 
-      console.info('[MNQDeltaTrend][ENTRY:broker-ok]', {
-        side: signal.signal,
-        qty,
-        entryPrice: bar.close
-      });
-
-      // seed trailing/position state
-      try { (this.calculator as any).setPosition?.(bar.close, direction, atr); } catch {}
+      // Inform calculator (for trailing stop anchors)
+      // Use public hook if present; otherwise, guard with try
+      try {
+        (this.calculator as any).setPosition?.(bar.close, direction, atr);
+      } catch {}
 
     } catch (err) {
-      // release lock on failure
-      this.localOpenQty = 0;
-      console.error('[MNQDeltaTrend][ENTRY] placement failed:', err);
+      console.error('[MNQDeltaTrend][order] placement failed:', err);
     }
   }
 }

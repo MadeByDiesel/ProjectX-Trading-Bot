@@ -193,10 +193,10 @@ export class MNQDeltaTrendCalculator {
     const barsSinceEntry = this.bars3min.filter(b => new Date(b.timestamp).getTime() > entryTime).length;
     if (barsSinceEntry < minBars) return null;
 
-    if (direction === 'long' && bar.close <= stopLoss) {
+    if (direction === 'long' && bar.low <= stopLoss) {
       return { signal: 'sell', reason: `Hit stop (${stopLoss.toFixed(2)})`, confidence: 1.0 };
     }
-    if (direction === 'short' && bar.close >= stopLoss) {
+    if (direction === 'short' && bar.high >= stopLoss) {
       return { signal: 'buy', reason: `Hit stop (${stopLoss.toFixed(2)})`, confidence: 1.0 };
     }
     return null;
@@ -231,9 +231,25 @@ export class MNQDeltaTrendCalculator {
     gates: { brokeUpCloseTol: boolean; brokeDownCloseTol: boolean; ltfEmaPass: boolean }
   ): TradeSignal {
     const { brokeUpCloseTol, brokeDownCloseTol, ltfEmaPass } = gates;
-    const atrMin = this.config.minAtrToTrade ?? 0;
-    if (!(Number.isFinite(marketState.atr) && marketState.atr > atrMin)) {
-      return { signal: 'hold', reason: 'ATR below threshold', confidence: 0 };
+
+    // Read from StrategyConfig (UI fields). Fallbacks keep backward compatibility.
+    const atrMultiplier =
+      (this.config as any).atrMultiplier ??
+      (this.config as any).atr_mult ??           // python-style key (if passed through)
+      1.0;
+
+    const atrThreshold =
+      (this.config as any).atrThreshold ??
+      (this.config as any).atr_threshold ??       // python-style key (if passed through)
+      (this.config.minAtrToTrade ?? 0);
+
+    // Gate: (ATR * multiplier) > threshold
+    if (!(Number.isFinite(marketState.atr) && (marketState.atr * atrMultiplier) > atrThreshold)) {
+      return {
+        signal: 'hold',
+        reason: `ATR gate failed (atr=${Number.isFinite(marketState.atr) ? marketState.atr.toFixed(2) : 'NaN'}, mult=${atrMultiplier}, thresh=${atrThreshold})`,
+        confidence: 0
+      };
     }
 
     const scale = (this.config as any).deltaScale ?? 1;
@@ -248,8 +264,20 @@ export class MNQDeltaTrendCalculator {
 
     const delta = bar.delta ?? 0;
     const absDelta = Math.abs(delta);
-    const passDeltaLong = absDelta > spike && absDelta > surge && delta > 0;
-    const passDeltaShort = absDelta > spike && absDelta > surge && delta < 0;
+
+    // ✅ FIXED: parity with Pine — fire if spike OR surge condition met
+    const passDeltaLong  = (delta > 0) && (absDelta >= spike || absDelta >= surge);
+    const passDeltaShort = (delta < 0) && (absDelta >= spike || absDelta >= surge);
+
+    // 🔍 DEBUG: log delta gate evaluation for every bar
+    console.debug('[MNQDeltaTrend][deltaCheck]', {
+      delta,
+      absDelta,
+      spike,
+      surge,
+      passDeltaLong,
+      passDeltaShort,
+    });
 
     if (this.config.useEmaFilter && !ltfEmaPass) {
       return { signal: 'hold', reason: 'LTF EMA filter not passed', confidence: 0 };

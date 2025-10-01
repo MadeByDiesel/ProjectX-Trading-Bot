@@ -43,6 +43,8 @@ export interface StrategyConfig {
   deltaScale?: number;    // scale factor to match Pine’s delta magnitude (default 1)
 
   htfUseForming?: boolean; 
+  sendWebhook: boolean;     // toggle sending webhooks
+  webhookUrl: string;       // destination URL (empty => disabled)
 }
 
 // === Bar / Market / Signal types used by calculator & trader ===

@@ -2,6 +2,8 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
 import App from './App';
+import { ThemeProvider, CssBaseline } from '@mui/material';
+import darkTheme from './theme'; // <-- make sure this file exists
 import reportWebVitals from './reportWebVitals';
 
 const root = ReactDOM.createRoot(
@@ -9,7 +11,10 @@ const root = ReactDOM.createRoot(
 );
 root.render(
   <React.StrictMode>
-    <App />
+    <ThemeProvider theme={darkTheme}>
+      <CssBaseline /> {/* Applies dark mode baseline styles */}
+      <App />
+    </ThemeProvider>
   </React.StrictMode>
 );
 

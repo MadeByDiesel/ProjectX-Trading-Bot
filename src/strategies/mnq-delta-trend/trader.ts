@@ -39,6 +39,23 @@ export class MNQDeltaTrendTrader {
   // Keep a bound handler so we can remove/ignore as needed
   private marketDataHandler = (q: GatewayQuote & { contractId: string }) => this.onQuote(q);
 
+  // --- webhook helper ---
+  private async postWebhook(payload: { symbol: string; action: 'BUY' | 'SELL' | 'FLAT'; qty?: number }) {
+    if (!this.config.sendWebhook) return;
+    const url = (this.config.webhookUrl || '').trim();
+    if (!url) return;
+
+    try {
+      await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      console.error('[webhook] post failed:', err);
+    }
+  }
+
   constructor(opts: {
     client: ProjectXClient;
     calculator: MNQDeltaTrendCalculator;
@@ -144,6 +161,12 @@ export class MNQDeltaTrendTrader {
             console.info('[MNQDeltaTrend][EXIT] flattened via closePosition');
             this.calculator.clearPosition();
             this.isFlattening = false;
+
+            // --- webhook: flat ---
+            this.postWebhook({
+              symbol: this.symbol,
+              action: 'FLAT',
+            });
           })
           .catch((err) => {
             console.error('[MNQDeltaTrend][EXIT] flatten failed:', err);
@@ -293,6 +316,13 @@ export class MNQDeltaTrendTrader {
       try {
         (this.calculator as any).setPosition?.(bar.close, direction, atr);
       } catch {}
+
+      // --- webhook: entry ---
+      await this.postWebhook({
+        symbol: this.symbol,
+        action: signal.signal === 'buy' ? 'BUY' : 'SELL',
+        qty,
+      });
 
     } catch (err) {
       console.error('[MNQDeltaTrend][order] placement failed:', err);

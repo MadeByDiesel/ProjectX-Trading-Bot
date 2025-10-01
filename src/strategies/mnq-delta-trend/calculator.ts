@@ -66,6 +66,33 @@ export class MNQDeltaTrendCalculator {
       return { signal: 'hold', reason: 'Warm-up in progress', confidence: 0 };
     }
 
+    // --- SESSION GATE ---
+    try {
+      const tz = 'America/New_York';
+      const barTime = new Date(incoming.timestamp);
+      const options: Intl.DateTimeFormatOptions = {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+        timeZone: tz,
+      };
+      const hhmm = new Intl.DateTimeFormat('en-US', options).format(barTime); // e.g. "09:24"
+
+      const [h, m] = hhmm.split(':').map(n => parseInt(n, 10));
+      const currentMinutes = h * 60 + m;
+
+      const [sh, sm] = (this.config.tradingStartTime ?? '09:30').split(':').map(n => parseInt(n, 10));
+      const [eh, em] = (this.config.tradingEndTime ?? '15:55').split(':').map(n => parseInt(n, 10));
+      const startMinutes = sh * 60 + sm;
+      const endMinutes = eh * 60 + em;
+
+      if (currentMinutes < startMinutes || currentMinutes > endMinutes) {
+        return { signal: 'hold', reason: 'Out of session', confidence: 0 };
+      }
+    } catch (err) {
+      console.warn('[MNQDeltaTrend][SessionGate] failed to parse time:', err);
+    }
+
     const bar: BarData = {
       ...incoming,
       delta: typeof incoming.delta === 'number' && Number.isFinite(incoming.delta)

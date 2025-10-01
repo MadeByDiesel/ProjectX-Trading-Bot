@@ -10,9 +10,9 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
 
   // === DELTA CONFIGURATION (force easy entry) ===
   deltaSMALength: 20,           
-  deltaSpikeThreshold: 450,    
-  deltaSurgeMultiplier: 1.4,   
-  breakoutLookbackBars: 20,    
+  deltaSpikeThreshold: 600,   // 450 base 
+  deltaSurgeMultiplier: 1.4,  // 1.4 base
+  breakoutLookbackBars: 30,   // 20 base 
   deltaSlopeExitLength: 3,     
 
   // === EMA CONFIGURATION ===
@@ -24,12 +24,14 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
 
   // === ATR & EXIT CONFIGURATION ===
   atrProfitMultiplier: 1.0,    
-  atrStopLossMultiplier: 1.0,  //0.3-0.5
-  minAtrToTrade: 8,        
+  atrStopLossMultiplier: 0.70,  //0.3-0.5
+  minAtrToTrade: 9,        
   minBarsBeforeExit: 0,
 
   // === TRAILING STOP CONFIGURATION ===
-  useTrailingStop: true,    
+  useTrailingStop: true,
+  trailActivationATR: 0.50,
+  trailOffsetATR: 0.15,
 
   // === POSITION SIZING ===
   contractQuantity: 1,
@@ -39,12 +41,11 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   maxTotalDrawdown: 2500,
   maxDailyDrawdown: 2500,
 
-    // === TRAILING STOP CONFIGURATION ===
-  trailActivationATR: 0.5,
-  trailOffsetATR: 0.125,
+  requireDelta: true,                // set true only if you MUST have true delta from feed
+  deltaScale: 1,   
 
-  "requireDelta": true,                // set true only if you MUST have true delta from feed
-  "deltaScale": 1,                      // set this to match Pine’s scale if your volume units differ
+  sendWebhook: false,
+  webhookUrl: '',                   // set this to match Pine’s scale if your volume units differ
 
 };
 

@@ -6,32 +6,32 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
 
   // === TIME FILTER ===
   tradingStartTime: '09:30',
-  tradingEndTime:   '15:55',
+  tradingEndTime:   '16:00',
 
   // === DELTA CONFIGURATION (force easy entry) ===
   deltaSMALength: 20,           
-  deltaSpikeThreshold: 600,   // 450 base 
-  deltaSurgeMultiplier: 1.4,  // 1.4 base
-  breakoutLookbackBars: 30,   // 20 base 
+  deltaSpikeThreshold: 450,   // 450 base 
+  deltaSurgeMultiplier: 1.2,  // 1.4 base
+  breakoutLookbackBars: 20,   // 20 base 
   deltaSlopeExitLength: 3,     
 
   // === EMA CONFIGURATION ===
-  emaLength: 21,            
+  emaLength: 12,            
   useEmaFilter: true,       
   htfEMALength: 21,
   higherTimeframe: 15,
-  htfUseForming: false,
+  htfUseForming: true,
 
   // === ATR & EXIT CONFIGURATION ===
   atrProfitMultiplier: 1.0,    
-  atrStopLossMultiplier: 0.70,  //0.3-0.5
+  atrStopLossMultiplier: 0.5,  //0.3-0.5
   minAtrToTrade: 9,        
   minBarsBeforeExit: 0,
 
   // === TRAILING STOP CONFIGURATION ===
   useTrailingStop: true,
-  trailActivationATR: 0.50,
-  trailOffsetATR: 0.15,
+  trailActivationATR: 0.15,
+  trailOffsetATR: 0.08,
 
   // === POSITION SIZING ===
   contractQuantity: 1,
@@ -44,9 +44,8 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   requireDelta: true,                // set true only if you MUST have true delta from feed
   deltaScale: 1,   
 
-  sendWebhook: false,
-  webhookUrl: '',                   // set this to match Pine’s scale if your volume units differ
-
+  sendWebhook: true,
+  webhookUrl: 'http://192.168.4.170:8080/signal?secret=toast',
 };
 
 // src/strategies/mnq-delta-trend/config.ts

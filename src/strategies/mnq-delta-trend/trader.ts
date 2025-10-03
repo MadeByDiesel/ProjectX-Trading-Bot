@@ -39,20 +39,44 @@ export class MNQDeltaTrendTrader {
   // Keep a bound handler so we can remove/ignore as needed
   private marketDataHandler = (q: GatewayQuote & { contractId: string }) => this.onQuote(q);
 
-  // --- webhook helper ---
-  private async postWebhook(payload: { symbol: string; action: 'BUY' | 'SELL' | 'FLAT'; qty?: number }) {
-    if (!this.config.sendWebhook) return;
-    const url = (this.config.webhookUrl || '').trim();
-    if (!url) return;
+  // --- Webhook sender (no external deps; uses global fetch) ---
+  private async postWebhook(action: 'BUY' | 'SELL' | 'FLAT', qty?: number) {
+    const enabled = (this.config as any)?.sendWebhook === true;
+    const url = (this.config as any)?.webhookUrl as string | undefined;
+    if (!enabled || !url) return;
+
+    const payload: Record<string, any> = {
+      symbol: this.symbol,
+      action,
+      ...(typeof qty === 'number' ? { qty } : {}),
+      ts: new Date().toISOString(),
+    };
+
+    let res: Response | null = null;
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), 2000);
 
     try {
-      await fetch(url, {
+      res = await fetch(url, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload), // secret already in query string
+        signal: controller.signal,
       });
     } catch (err) {
-      console.error('[webhook] post failed:', err);
+      console.error('[webhook] post failed', err);
+      clearTimeout(to);
+      return; // <- critical: do not touch res if fetch threw
+    } finally {
+      clearTimeout(to);
+    }
+
+    if (!res) return; // extra guard
+
+    if (!res.ok) {
+      console.error(`[webhook] HTTP ${res.status} ${res.statusText}`);
+    } else {
+      console.info('[webhook] OK', payload);
     }
   }
 
@@ -158,15 +182,19 @@ export class MNQDeltaTrendTrader {
         // Fire-and-forget close to avoid making onQuote async
         this.client.closePosition(this.contractId)
           .then(() => {
+            // --- webhook for exit/flat ---
+            this.postWebhook('FLAT').catch(err => {
+              console.error('[webhook] FLAT post failed', err);
+            });
             console.info('[MNQDeltaTrend][EXIT] flattened via closePosition');
             this.calculator.clearPosition();
             this.isFlattening = false;
 
-            // --- webhook: flat ---
-            this.postWebhook({
-              symbol: this.symbol,
-              action: 'FLAT',
+            // --- webhook for exit/flat ---
+            this.postWebhook('FLAT').catch(err => {
+              console.error('[webhook] FLAT post failed', err);
             });
+
           })
           .catch((err) => {
             console.error('[MNQDeltaTrend][EXIT] flatten failed:', err);
@@ -317,11 +345,9 @@ export class MNQDeltaTrendTrader {
         (this.calculator as any).setPosition?.(bar.close, direction, atr);
       } catch {}
 
-      // --- webhook: entry ---
-      await this.postWebhook({
-        symbol: this.symbol,
-        action: signal.signal === 'buy' ? 'BUY' : 'SELL',
-        qty,
+      // --- webhook for entry ---
+      this.postWebhook(signal.signal === 'buy' ? 'BUY' : 'SELL', qty).catch(err => {
+        console.error('[webhook] entry post failed', err);
       });
 
     } catch (err) {

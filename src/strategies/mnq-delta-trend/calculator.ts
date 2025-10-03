@@ -108,7 +108,7 @@ export class MNQDeltaTrendCalculator {
     const atr = this.calculateATR();
     const trend = this.determineTrend();
     const { brokeUpCloseTol, brokeDownCloseTol } = this.checkBreakoutCloseTol();
-    const { ltfEmaPass } = this.checkLtfEmaFilter();
+    const { passLong, passShort } = this.checkLtfEmaFilter();
 
     marketState.atr = Number.isFinite(atr) ? atr : 0;
     marketState.higherTimeframeTrend = trend;
@@ -117,7 +117,7 @@ export class MNQDeltaTrendCalculator {
     const exitSignal = this.checkExitConditions(bar, marketState);
     if (exitSignal) return exitSignal;
 
-    return this.generateSignal(bar, marketState, { brokeUpCloseTol, brokeDownCloseTol, ltfEmaPass });
+    return this.generateSignal(bar, marketState, { brokeUpCloseTol, brokeDownCloseTol, passLong, passShort });
   }
 
   private updateHigherTimeframeBars(bar: BarData): void {
@@ -171,15 +171,30 @@ export class MNQDeltaTrendCalculator {
     return atr;
   }
 
-  private checkLtfEmaFilter(): { ltfEmaPass: boolean } {
-    if (!this.config.useEmaFilter) return { ltfEmaPass: true };
+  private checkLtfEmaFilter(): { passLong: boolean; passShort: boolean; lastClose: number; lastEma: number } {
+    if (!this.config.useEmaFilter) {
+      // no gating: allow both sides
+      const lastClose = this.bars3min.length ? this.bars3min[this.bars3min.length - 1].close : NaN;
+      return { passLong: true, passShort: true, lastClose, lastEma: NaN };
+    }
+
     const L = Math.max(1, this.config.emaLength ?? 21);
     const closes = this.bars3min.map(b => b.close);
-    if (closes.length < L) return { ltfEmaPass: false };
+    if (closes.length < L) {
+      return { passLong: false, passShort: false, lastClose: NaN, lastEma: NaN };
+    }
+
     const emaSeries = this.technical.calculateEMA(closes, L);
     const lastClose = closes[closes.length - 1];
     const lastEma = emaSeries[emaSeries.length - 1];
-    return { ltfEmaPass: lastClose >= lastEma };
+
+    // Directional parity: long only if above/at EMA, short only if below/at EMA
+    return {
+      passLong: lastClose >= lastEma,
+      passShort: lastClose <= lastEma,
+      lastClose,
+      lastEma
+    };
   }
 
   private determineTrend(): 'bullish' | 'bearish' | 'neutral' {
@@ -209,7 +224,7 @@ export class MNQDeltaTrendCalculator {
     const rangeLow = Math.min(...window.map(b => b.low));
     return {
       brokeUpCloseTol: last.close > rangeHigh * 0.995,
-      brokeDownCloseTol: last.close < rangeLow * 1.005,
+      brokeDownCloseTol: last.close < rangeLow * 0.995,
     };
   }
 
@@ -255,9 +270,9 @@ export class MNQDeltaTrendCalculator {
   private generateSignal(
     bar: BarData,
     marketState: MarketState,
-    gates: { brokeUpCloseTol: boolean; brokeDownCloseTol: boolean; ltfEmaPass: boolean }
+    gates: { brokeUpCloseTol: boolean; brokeDownCloseTol: boolean; passLong: boolean; passShort: boolean }
   ): TradeSignal {
-    const { brokeUpCloseTol, brokeDownCloseTol, ltfEmaPass } = gates;
+    const { brokeUpCloseTol, brokeDownCloseTol, passLong, passShort } = gates;
 
     // Read from StrategyConfig (UI fields). Fallbacks keep backward compatibility.
     const atrMultiplier =
@@ -306,19 +321,25 @@ export class MNQDeltaTrendCalculator {
       passDeltaShort,
     });
 
-    if (this.config.useEmaFilter && !ltfEmaPass) {
-      return { signal: 'hold', reason: 'LTF EMA filter not passed', confidence: 0 };
-    }
-
     const htf = marketState.higherTimeframeTrend;
     console.debug('[MNQDeltaTrend][deltaCheck]', { delta, absDelta, spike, surge, passDeltaLong, passDeltaShort });
 
+    // LONG decision (needs LTF above EMA when filter enabled)
     if (passDeltaLong && htf === 'bullish' && brokeUpCloseTol) {
+      if (this.config.useEmaFilter && !passLong) {
+        return { signal: 'hold', reason: 'LTF EMA long filter not passed', confidence: 0 };
+      }
       return { signal: 'buy', reason: `Delta spike ${delta} > ${spike}, bullish HTF, close>rangeHigh*0.995`, confidence: 0.9 };
     }
+
+    // SHORT decision (needs LTF below EMA when filter enabled)
     if (passDeltaShort && htf === 'bearish' && brokeDownCloseTol) {
+      if (this.config.useEmaFilter && !passShort) {
+        return { signal: 'hold', reason: 'LTF EMA short filter not passed', confidence: 0 };
+      }
       return { signal: 'sell', reason: `Delta spike ${delta} < -${spike}, bearish HTF, close<rangeLow*1.005`, confidence: 0.9 };
     }
+
     return { signal: 'hold', reason: 'No strong signal', confidence: 0 };
   }
 

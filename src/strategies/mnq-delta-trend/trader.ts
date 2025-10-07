@@ -3,6 +3,7 @@ import { ProjectXClient } from '../../services/projectx-client';
 import { MNQDeltaTrendCalculator } from './calculator';
 import { StrategyConfig } from './types'; // uses your local MNQ types
 import { GatewayQuote, BarData } from '../../types'; // SignalR types come from global app types
+import { execFile, ExecFileException, ExecFileOptionsWithStringEncoding } from 'child_process';
 
 export class MNQDeltaTrendTrader {
   private client: ProjectXClient;
@@ -39,45 +40,60 @@ export class MNQDeltaTrendTrader {
   // Keep a bound handler so we can remove/ignore as needed
   private marketDataHandler = (q: GatewayQuote & { contractId: string }) => this.onQuote(q);
 
-  // --- Webhook sender (no external deps; uses global fetch) ---
-  private async postWebhook(action: 'BUY' | 'SELL' | 'FLAT', qty?: number) {
-    const enabled = (this.config as any)?.sendWebhook === true;
-    const url = (this.config as any)?.webhookUrl as string | undefined;
-    if (!enabled || !url) return;
+  /** Post trade events to the local NT8 webhook listener (curl-based, no deps) */
+  private async postWebhook(action: 'BUY' | 'SELL' | 'FLAT', qty?: number): Promise<void> {
+    const base = this.config.webhookUrl || '';
+    if (!base) return;
 
-    const payload: Record<string, any> = {
-      symbol: this.symbol,
-      action,
-      ...(typeof qty === 'number' ? { qty } : {}),
-      ts: new Date().toISOString(),
+    // If url has no query and we have a secret, append it. If it already has ?, leave it as-is.
+    const secret = (this as any).config?.webhookSecret;
+    const url = (!base.includes('?') && secret) ? `${base}?secret=${secret}` : base;
+
+    // NT8: qty > 0 required for BUY/SELL; FLAT must omit qty
+    const payload: Record<string, any> = { symbol: 'MNQ', action };
+    if (action !== 'FLAT') payload.qty = Math.max(1, Number(qty ?? 1));
+
+    const body = JSON.stringify(payload);
+
+    // Bind to your fixed LAN interface (override via config if you want)
+    const localIf = (this as any).config?.webhookInterface || '192.168.4.50';
+
+    const args: string[] = [
+      '--interface', localIf,
+      '--fail',                 // make 4xx/5xx exit non-zero
+      '-sS',                    // quiet but show errors
+      '-X', 'POST',
+      '-H', 'Content-Type: application/json',
+      '--max-time', '3',        // seconds (curl-level timeout)
+      '--data-binary', body,
+      url
+    ];
+
+    const opts: ExecFileOptionsWithStringEncoding = {
+      timeout: 4000,            // child-process timeout (a bit higher than curl)
+      encoding: 'utf8'
     };
 
-    let res: Response | null = null;
-    const controller = new AbortController();
-    const to = setTimeout(() => controller.abort(), 2000);
-
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload), // secret already in query string
-        signal: controller.signal,
-      });
-    } catch (err) {
-      console.error('[webhook] post failed', err);
-      clearTimeout(to);
-      return; // <- critical: do not touch res if fetch threw
-    } finally {
-      clearTimeout(to);
-    }
-
-    if (!res) return; // extra guard
-
-    if (!res.ok) {
-      console.error(`[webhook] HTTP ${res.status} ${res.statusText}`);
-    } else {
-      console.info('[webhook] OK', payload);
-    }
+    await new Promise<void>((resolve) => {
+      execFile(
+        '/usr/bin/curl',
+        args,
+        opts,
+        (error: ExecFileException | null, stdout: string, stderr: string) => {
+          if (error) {
+            console.error('[webhook] curl error', error.message, stderr || '');
+            return resolve();
+          }
+          // OK (curl --fail succeeded). NT8 usually returns {"status":"accepted"}
+          if (stdout?.trim()) {
+            console.info('[webhook] sent', payload, 'resp=', stdout.trim());
+          } else {
+            console.info('[webhook] sent', payload);
+          }
+          resolve();
+        }
+      );
+    });
   }
 
   constructor(opts: {
@@ -113,6 +129,7 @@ export class MNQDeltaTrendTrader {
     }, 1000);
 
     console.info(`[MNQDeltaTrend][Trader] started for ${this.symbol} (contractId=${this.contractId})`);
+
   }
 
   /** Optional: stop receiving data & clear timers. Safe to call multiple times. */
@@ -182,18 +199,11 @@ export class MNQDeltaTrendTrader {
         // Fire-and-forget close to avoid making onQuote async
         this.client.closePosition(this.contractId)
           .then(() => {
-            // --- webhook for exit/flat ---
-            this.postWebhook('FLAT').catch(err => {
-              console.error('[webhook] FLAT post failed', err);
-            });
             console.info('[MNQDeltaTrend][EXIT] flattened via closePosition');
             this.calculator.clearPosition();
             this.isFlattening = false;
 
-            // --- webhook for exit/flat ---
-            this.postWebhook('FLAT').catch(err => {
-              console.error('[webhook] FLAT post failed', err);
-            });
+            this.postWebhook('FLAT');
 
           })
           .catch((err) => {
@@ -345,10 +355,12 @@ export class MNQDeltaTrendTrader {
         (this.calculator as any).setPosition?.(bar.close, direction, atr);
       } catch {}
 
-      // --- webhook for entry ---
-      this.postWebhook(signal.signal === 'buy' ? 'BUY' : 'SELL', qty).catch(err => {
+      // ✅ Send ENTRY webhook only after order success
+      try {
+        this.postWebhook(signal.signal === 'buy' ? 'BUY' : 'SELL', qty);
+      } catch (err) {
         console.error('[webhook] entry post failed', err);
-      });
+      }
 
     } catch (err) {
       console.error('[MNQDeltaTrend][order] placement failed:', err);

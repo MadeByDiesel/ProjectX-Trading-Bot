@@ -162,6 +162,28 @@ export class SignalRService {
     conn.onreconnected(async () => {
       this.logger.info('Market Hub reconnected — re-subscribing existing contracts');
       await this.resubscribeAllContracts();
+
+      // --- Restore open MNQ position after reconnect ---
+      try {
+        const { projectXClient, trader } = global as any; // both already initialized in server.ts
+        if (projectXClient && trader) {
+          const openPositions = await projectXClient.searchOpenPositions();
+          const mnq = openPositions.find((p: any) => p.contractId?.includes('MNQ'));
+          if (mnq) {
+            const side = mnq.side === 1 ? 'short' : 'long';
+            const avgPrice = mnq.avgPrice;
+            const currentATR = trader.calculator.calculateATR();
+            trader.calculator.setPosition(avgPrice, side, currentATR);
+            this.logger.info('[reconnect] Restored open MNQ position', { side, avgPrice });
+          } else {
+            this.logger.info('[reconnect] No open MNQ positions to restore');
+          }
+        } else {
+          this.logger.warn('[reconnect] Trader or ProjectX client not available in global scope');
+        }
+      } catch (err) {
+        this.logger.error('[reconnect] Failed to restore open position', err);
+      }
     });
   }
 

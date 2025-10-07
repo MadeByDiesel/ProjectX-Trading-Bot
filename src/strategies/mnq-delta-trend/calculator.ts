@@ -41,13 +41,22 @@ export class MNQDeltaTrendCalculator {
 
   /** Warm-up loader */
   processWarmUpBar(bar: BarData, timeframe: '3min' | 'HTF'): void {
+    const arr = timeframe === '3min' ? this.bars3min : this.bars15min;
+
+    const prevClose = arr.length ? arr[arr.length - 1].close : NaN;
+    const vol = Number.isFinite(bar.volume as any) ? Number(bar.volume) : 0;
+    const signedVol =
+      Number.isFinite(prevClose) && Number.isFinite(bar.close)
+        ? (bar.close > prevClose ? vol : bar.close < prevClose ? -vol : 0)
+        : 0;
+
     const normalized: BarData = {
       ...bar,
-      delta: typeof bar.delta === 'number' && Number.isFinite(bar.delta)
-        ? bar.delta
-        : Number((bar.close - bar.open).toFixed(2)),
+      delta: (typeof bar.delta === 'number' && Number.isFinite(bar.delta))
+        ? Math.trunc(bar.delta)
+        : Math.trunc(signedVol),
     };
-    const arr = timeframe === '3min' ? this.bars3min : this.bars15min;
+
     arr.push(normalized);
     if (timeframe === '3min' && this.bars3min.length > 2000) this.bars3min.shift();
     if (timeframe === 'HTF' && this.bars15min.length > 1000) this.bars15min.shift();
@@ -93,11 +102,18 @@ export class MNQDeltaTrendCalculator {
       console.warn('[MNQDeltaTrend][SessionGate] failed to parse time:', err);
     }
 
+    const prevClose3m = this.bars3min.length ? this.bars3min[this.bars3min.length - 1].close : NaN;
+    const vol = Number.isFinite(incoming.volume as any) ? Number(incoming.volume) : 0;
+    const signedVol =
+      Number.isFinite(prevClose3m) && Number.isFinite(incoming.close)
+        ? (incoming.close > prevClose3m ? vol : incoming.close < prevClose3m ? -vol : 0)
+        : 0;
+
     const bar: BarData = {
       ...incoming,
-      delta: typeof incoming.delta === 'number' && Number.isFinite(incoming.delta)
+      delta: (typeof incoming.delta === 'number' && Number.isFinite(incoming.delta))
         ? Math.trunc(incoming.delta)
-        : Number((incoming.close - incoming.open).toFixed(2)),
+        : Math.trunc(signedVol),
     };
 
     this.bars3min.push(bar);
@@ -190,8 +206,8 @@ export class MNQDeltaTrendCalculator {
 
     // Directional parity: long only if above/at EMA, short only if below/at EMA
     return {
-      passLong: lastClose >= lastEma,
-      passShort: lastClose <= lastEma,
+      passLong: lastClose > lastEma,
+      passShort: lastClose < lastEma,
       lastClose,
       lastEma
     };
@@ -200,7 +216,7 @@ export class MNQDeltaTrendCalculator {
   private determineTrend(): 'bullish' | 'bearish' | 'neutral' {
     if (this.bars15min.length < 2) return 'neutral';
     const L = Math.max(1, this.config.htfEMALength ?? 50);
-    const useForming = this.config.htfUseForming !== false;
+    const useForming = this.config.htfUseForming === true;
     const lastIdx = useForming ? this.bars15min.length - 1 : this.bars15min.length - 2;
     if (lastIdx < 0) return 'neutral';
 
@@ -215,16 +231,20 @@ export class MNQDeltaTrendCalculator {
 
   private checkBreakoutCloseTol() {
     const n = Math.max(1, this.config.breakoutLookbackBars ?? 20);
-    if (this.bars3min.length < n + 1) {
+    if (this.bars3min.length < n) {
       return { brokeUpCloseTol: false, brokeDownCloseTol: false };
     }
-    const last = this.bars3min[this.bars3min.length - 1];
-    const window = this.bars3min.slice(-n - 1, -1);
+
+    // include the current bar in the window (Pine ta.highest/lowest includes current)
+    const window = this.bars3min.slice(-n);
+    const last = window[window.length - 1];
+
     const rangeHigh = Math.max(...window.map(b => b.high));
-    const rangeLow = Math.min(...window.map(b => b.low));
+    const rangeLow  = Math.min(...window.map(b => b.low));
+
     return {
-      brokeUpCloseTol: last.close > rangeHigh * 0.995,
-      brokeDownCloseTol: last.close < rangeLow * 0.995,
+      brokeUpCloseTol:   last.close > rangeHigh * 0.995,
+      brokeDownCloseTol: last.close < rangeLow  * 1.005,  // fix: 1.005 for shorts
     };
   }
 
@@ -267,6 +287,111 @@ export class MNQDeltaTrendCalculator {
     return sum / n;
   }
 
+  private smaSignedDelta(n: number, endIndex: number): number {
+    if (endIndex < 0) return NaN;
+    const start = Math.max(0, endIndex - n + 1);
+    if (endIndex - start + 1 < n) return NaN; // require full window like Pine
+    let sum = 0;
+    for (let i = start; i <= endIndex; i++) {
+      const d = (this.bars3min[i].delta ?? (this.bars3min[i].close - (this.bars3min[i - 1]?.close ?? this.bars3min[i].open)));
+      sum += Number(d) || 0;
+    }
+    return sum / n;
+  }
+
+  // private generateSignal(
+  //   bar: BarData,
+  //   marketState: MarketState,
+  //   gates: { brokeUpCloseTol: boolean; brokeDownCloseTol: boolean; passLong: boolean; passShort: boolean }
+  // ): TradeSignal {
+  //   const { brokeUpCloseTol, brokeDownCloseTol, passLong, passShort } = gates;
+
+  //   // Read from StrategyConfig (UI fields). Fallbacks keep backward compatibility.
+  //   const atrMultiplier =
+  //     (this.config as any).atrMultiplier ??
+  //     (this.config as any).atr_mult ??           // python-style key (if passed through)
+  //     1.0;
+
+  //   const atr = marketState.atr;
+  //   const atrThreshold =
+  //     (this.config as any).atrThreshold ??
+  //     (this.config as any).atr_threshold ??
+  //     (this.config.minAtrToTrade ?? 0);
+
+  //   // Pine: atr > threshold (no multiplier)
+  //   if (!(Number.isFinite(atr) && atr > atrThreshold)) {
+  //     return {
+  //       signal: 'hold',
+  //       reason: `ATR gate failed (atr=${Number.isFinite(atr) ? atr.toFixed(2) : 'NaN'} <= ${atrThreshold})`,
+  //       confidence: 0
+  //     };
+  //   }
+
+  //   const scale = (this.config as any).deltaScale ?? 1;
+  //   const spike = (this.config.deltaSpikeThreshold ?? 750) * scale;
+
+  //   const len = Math.max(1, this.config.deltaSMALength ?? 20);
+  //   const smaSigned = this.smaSignedDelta(len, this.bars3min.length - 1);
+  //   const hasSMA = Number.isFinite(smaSigned);
+  //   const mult = this.config.deltaSurgeMultiplier ?? 1.0;
+
+  //   const delta = bar.delta ?? 0;
+
+  //   // Pine: BOTH spike and surge must pass (signed SMA)
+  //   const passDeltaLong  = (delta > 0) && (delta >= spike) && hasSMA && (delta >=  smaSigned * mult);
+  //   const passDeltaShort = (delta < 0) && (-delta >= spike) && hasSMA && (delta <= -smaSigned * mult);
+
+  //   // 🔍 DEBUG
+  //   console.debug('[MNQDeltaTrend][deltaCheck]', {
+  //     delta, spike, smaSigned, mult, passDeltaLong, passDeltaShort,
+  //   });
+  //   // const scale = (this.config as any).deltaScale ?? 1;
+  //   // const spike = (this.config.deltaSpikeThreshold ?? 750) * scale;
+  //   // const len = Math.max(1, this.config.deltaSMALength ?? 20);
+  //   // let avgAbsDelta = NaN;
+  //   // if (this.bars3min.length >= len) {
+  //   //   const recent = this.bars3min.slice(-len);
+  //   //   avgAbsDelta = recent.reduce((s, b) => s + Math.abs(b.delta ?? (b.close - b.open)), 0) / len;
+  //   // }
+  //   // const surge = Number.isFinite(avgAbsDelta) ? avgAbsDelta * (this.config.deltaSurgeMultiplier ?? 1.0) : 0;
+
+  //   // const delta = bar.delta ?? 0;
+  //   // const absDelta = Math.abs(delta);
+
+  //   // // calculator.ts → generateSignal()
+  //   // const threshold = Math.max(spike, surge);          // require the stronger of the two
+  //   // const passDeltaLong  = (delta > 0) && (absDelta >= threshold);
+  //   // const passDeltaShort = (delta < 0) && (absDelta >= threshold);
+
+  //   // // 🔍 DEBUG: log delta gate evaluation for every bar
+  //   // console.debug('[MNQDeltaTrend][deltaCheck]', {
+  //   //   delta,
+  //   //   absDelta,
+  //   //   spike,
+  //   //   surge,
+  //   //   passDeltaLong,
+  //   //   passDeltaShort,
+  //   // });
+
+  //   const htf = marketState.higherTimeframeTrend;
+
+  //   if (passDeltaLong && htf === 'bullish' && brokeUpCloseTol) {
+  //     if (this.config.useEmaFilter && !passLong) {
+  //       return { signal: 'hold', reason: 'LTF EMA long filter not passed', confidence: 0 };
+  //     }
+  //     return { signal: 'buy', reason: `Δ ok, bullish HTF, close > rangeHigh*0.995`, confidence: 0.9 };
+  //   }
+
+  //   if (passDeltaShort && htf === 'bearish' && brokeDownCloseTol) {
+  //     if (this.config.useEmaFilter && !passShort) {
+  //       return { signal: 'hold', reason: 'LTF EMA short filter not passed', confidence: 0 };
+  //     }
+  //     return { signal: 'sell', reason: `Δ ok, bearish HTF, close < rangeLow*1.005`, confidence: 0.9 };
+  //   }
+  //   return { signal: 'hold', reason: 'No strong signal', confidence: 0 };
+  // }
+//
+
   private generateSignal(
     bar: BarData,
     marketState: MarketState,
@@ -274,76 +399,92 @@ export class MNQDeltaTrendCalculator {
   ): TradeSignal {
     const { brokeUpCloseTol, brokeDownCloseTol, passLong, passShort } = gates;
 
-    // Read from StrategyConfig (UI fields). Fallbacks keep backward compatibility.
-    const atrMultiplier =
-      (this.config as any).atrMultiplier ??
-      (this.config as any).atr_mult ??           // python-style key (if passed through)
-      1.0;
-
-    const atrThreshold =
-      (this.config as any).atrThreshold ??
-      (this.config as any).atr_threshold ??       // python-style key (if passed through)
-      (this.config.minAtrToTrade ?? 0);
-
-    // Gate: (ATR * multiplier) > threshold
-    if (!(Number.isFinite(marketState.atr) && (marketState.atr * atrMultiplier) > atrThreshold)) {
+    // ATR gate (Pine: atr > threshold, no multiplier)
+    const atr = marketState.atr;
+    const atrThreshold = this.config.minAtrToTrade ?? 0;
+    
+    if (!(Number.isFinite(atr) && atr > atrThreshold)) {
       return {
         signal: 'hold',
-        reason: `ATR gate failed (atr=${Number.isFinite(marketState.atr) ? marketState.atr.toFixed(2) : 'NaN'}, mult=${atrMultiplier}, thresh=${atrThreshold})`,
+        reason: `ATR gate failed (${atr?.toFixed(2) ?? 'NaN'} <= ${atrThreshold})`,
         confidence: 0
       };
     }
 
-    const scale = (this.config as any).deltaScale ?? 1;
-    const spike = (this.config.deltaSpikeThreshold ?? 750) * scale;
-    const len = Math.max(1, this.config.deltaSMALength ?? 20);
-    let avgAbsDelta = NaN;
-    if (this.bars3min.length >= len) {
-      const recent = this.bars3min.slice(-len);
-      avgAbsDelta = recent.reduce((s, b) => s + Math.abs(b.delta ?? (b.close - b.open)), 0) / len;
-    }
-    const surge = Number.isFinite(avgAbsDelta) ? avgAbsDelta * (this.config.deltaSurgeMultiplier ?? 1.0) : 0;
-
+    // Delta spike threshold
+    const spike = this.config.deltaSpikeThreshold ?? 750;
     const delta = bar.delta ?? 0;
     const absDelta = Math.abs(delta);
 
-    // ✅ FIXED: parity with Pine — fire if spike OR surge condition met
-    const passDeltaLong  = (delta > 0) && (absDelta >= spike || absDelta >= surge);
-    const passDeltaShort = (delta < 0) && (absDelta >= spike || absDelta >= surge);
+    // Signed delta SMA for surge comparison (Pine: ta.sma(delta, length))
+    const len = Math.max(1, this.config.deltaSMALength ?? 20);
+    const deltaSMA = this.smaSignedDelta(len, this.bars3min.length - 1);
+    
+    if (!Number.isFinite(deltaSMA)) {
+      return { signal: 'hold', reason: 'Delta SMA not ready', confidence: 0 };
+    }
 
-    // 🔍 DEBUG: log delta gate evaluation for every bar
+    const surgeMult = this.config.deltaSurgeMultiplier ?? 1.0;
+
+    // Pine parity: both spike AND surge must pass
+    // Long:  delta > spike  AND  delta > (deltaSMA * surgeMult)
+    // Short: delta < -spike AND  delta < (deltaSMA * -surgeMult)
+    const passDeltaLong = (
+      delta > spike && 
+      delta > (deltaSMA * surgeMult)
+    );
+
+    const passDeltaShort = (
+      delta < -spike &&
+      delta < (deltaSMA * surgeMult)   // Pine parity (no minus on surgeMult)
+    );
+    
+    // const passDeltaShort = (
+    //   delta < -spike && 
+    //   delta < (deltaSMA * -surgeMult)  // Note: -surgeMult, not negating deltaSMA
+    // );
+
     console.debug('[MNQDeltaTrend][deltaCheck]', {
       delta,
       absDelta,
       spike,
-      surge,
+      deltaSMA,
+      surgeMult,
+      longThreshold: deltaSMA * surgeMult,
+      shortThreshold: deltaSMA * -surgeMult,
       passDeltaLong,
       passDeltaShort,
     });
 
     const htf = marketState.higherTimeframeTrend;
-    console.debug('[MNQDeltaTrend][deltaCheck]', { delta, absDelta, spike, surge, passDeltaLong, passDeltaShort });
 
-    // LONG decision (needs LTF above EMA when filter enabled)
+    // Long entry
     if (passDeltaLong && htf === 'bullish' && brokeUpCloseTol) {
       if (this.config.useEmaFilter && !passLong) {
         return { signal: 'hold', reason: 'LTF EMA long filter not passed', confidence: 0 };
       }
-      return { signal: 'buy', reason: `Delta spike ${delta} > ${spike}, bullish HTF, close>rangeHigh*0.995`, confidence: 0.9 };
+      return { 
+        signal: 'buy', 
+        reason: `Δ=${delta.toFixed(0)} > spike=${spike} & > SMA×mult=${(deltaSMA * surgeMult).toFixed(0)}, bullish HTF, breakout`, 
+        confidence: 0.9 
+      };
     }
 
-    // SHORT decision (needs LTF below EMA when filter enabled)
+    // Short entry
     if (passDeltaShort && htf === 'bearish' && brokeDownCloseTol) {
       if (this.config.useEmaFilter && !passShort) {
         return { signal: 'hold', reason: 'LTF EMA short filter not passed', confidence: 0 };
       }
-      return { signal: 'sell', reason: `Delta spike ${delta} < -${spike}, bearish HTF, close<rangeLow*1.005`, confidence: 0.9 };
+      return { 
+        signal: 'sell', 
+        reason: `Δ=${delta.toFixed(0)} < -spike=${-spike} & < SMA×(-mult)=${(deltaSMA * -surgeMult).toFixed(0)}, bearish HTF, breakdown`, 
+        confidence: 0.9 
+      };
     }
 
     return { signal: 'hold', reason: 'No strong signal', confidence: 0 };
   }
 
-  // ---------------- Sizing/Stops API ----------------
   calculatePositionSize(currentPrice: number, atr: number, accountBalance: number): number {
     void currentPrice; // not used in this sizing model
     const riskAmount = accountBalance * 0.01; // 1% risk per trade

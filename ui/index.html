@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en" class="bg-gray-900 text-white">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>MNQ Delta Trend — Control Panel</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <style>[x-cloak]{display:none!important}</style>
+</head>
+<body x-data="mnqApp()" x-init="init()" class="min-h-screen">
+  <div class="container mx-auto p-4">
+    <!-- Header -->
+    <header class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <!-- Accounts -->
+      <section class="bg-gray-800 rounded-xl p-4">
+        <h2 class="text-lg font-semibold mb-3">Select Trading Account</h2>
+        <div class="space-y-2">
+          <label class="text-sm text-gray-300">Tradeable Accounts</label>
+          <select x-model="selectedAccountId" :disabled="isTrading"
+                  class="w-full p-2 bg-gray-700 rounded text-white disabled:opacity-50">
+            <option value="">Select an account…</option>
+            <template x-for="a in accounts" :key="a.id ?? a.accountId ?? a.accountNumber">
+              <option :value="a.id ?? a.accountId ?? a.accountNumber"
+                      x-text="`${a.name ?? a.accountNumber ?? a.id} - $${(a.balance ?? 0).toLocaleString()}`"></option>
+            </template>
+          </select>
+
+          <div class="mt-2 text-sm text-gray-300" x-show="activeAccountSummary">
+            <div class="flex items-center gap-2">
+              <span class="inline-block w-2 h-2 rounded-full" :class="isTrading ? 'bg-green-500' : 'bg-gray-500'"></span>
+              <span class="text-gray-200">Selected:</span>
+              <span class="font-medium" x-text="activeAccountSummary"></span>
+            </div>
+          </div>
+
+          <div class="flex gap-2 mt-3">
+            <button @click="confirmAccount()" :disabled="!selectedAccountId || isTrading"
+                    class="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700 disabled:opacity-50">Confirm Account</button>
+            <button @click="clearAccount()" :disabled="!selectedAccountId || isTrading"
+                    class="px-4 py-2 bg-gray-700 rounded hover:bg-gray-600 disabled:opacity-50">Clear</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Status -->
+      <section class="bg-gray-800 rounded-xl p-4">
+        <div class="flex items-start justify-between">
+          <h2 class="text-lg font-semibold">Strategy Status</h2>
+          <div class="text-sm text-gray-400" x-text="activeAccountSummary ? `Account: ${activeAccountSummary}` : ''"></div>
+        </div>
+        <div class="mt-3 flex items-center gap-3">
+          <span class="px-3 py-1 rounded-full text-xs font-semibold"
+                :class="isTrading ? 'bg-green-600' : 'bg-gray-600'"
+                x-text="isTrading ? 'RUNNING' : 'STOPPED'"></span>
+          <button @click="startStrategy()" :disabled="!selectedAccountId || isTrading"
+                  class="px-4 py-2 bg-green-600 rounded hover:bg-green-700 disabled:opacity-50">START</button>
+          <button @click="stopStrategy()" :disabled="!isTrading"
+                  class="px-4 py-2 bg-red-600 rounded hover:bg-red-700 disabled:opacity-50">STOP</button>
+        </div>
+        <div class="mt-4 text-sm text-gray-300 space-y-1">
+          <div>Session: <span class="font-medium" x-text="`${configs.tradingStartTime} - ${configs.tradingEndTime} ET`"></span></div>
+          <div>Contracts: <span class="font-medium" x-text="configs.contractQuantity"></span></div>
+        </div>
+      </section>
+    </header>
+
+    <!-- Tabs -->
+    <nav class="mt-6 border-b border-gray-800">
+      <ul class="flex gap-6">
+        <li>
+          <button class="pb-3 text-sm"
+                  :class="activeTab==='config' ? 'text-white border-b-2 border-blue-500' : 'text-gray-400 hover:text-white'"
+                  @click="activeTab='config'">CONFIGURATION</button>
+        </li>
+        <li>
+          <button class="pb-3 text-sm"
+                  :class="activeTab==='monitor' ? 'text-white border-b-2 border-blue-500' : 'text-gray-400 hover:text-white'"
+                  @click="activeTab='monitor'">TRADE MONITOR</button>
+        </li>
+      </ul>
+    </nav>
+
+    <!-- Panels -->
+    <main class="mt-4">
+      <!-- CONFIG -->
+      <section x-show="activeTab==='config'" x-cloak class="bg-gray-800 rounded-xl p-4">
+        <h3 class="text-base font-semibold mb-3">MNQ Delta Trend Configuration</h3>
+
+        <!-- TIME FILTER + QTY (realigned top row) -->
+        <div class="grid grid-cols-1 md:grid-cols-12 gap-4 mb-6">
+          <div class="md:col-span-4">
+            <label class="text-sm text-gray-300">Start Time (ET)</label>
+            <input type="text" placeholder="09:30" x-model="configs.tradingStartTime" @input="markDirty()"
+                   class="mt-1 w-full p-2 bg-gray-700 rounded text-white text-center"/>
+          </div>
+          <div class="md:col-span-4">
+            <label class="text-sm text-gray-300">End Time (ET)</label>
+            <input type="text" placeholder="16:00" x-model="configs.tradingEndTime" @input="markDirty()"
+                   class="mt-1 w-full p-2 bg-gray-700 rounded text-white text-center"/>
+          </div>
+          <div class="md:col-span-4">
+            <label class="text-sm text-gray-300">Contracts</label>
+            <input type="number" min="1" x-model.number="configs.contractQuantity" @input="markDirty()"
+                   class="mt-1 w-full p-2 bg-gray-700 rounded text-white text-center"/>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <!-- Left -->
+          <div class="space-y-6">
+            <!-- DELTA -->
+            <div>
+              <h4 class="text-sm text-gray-400 mb-2">Delta Configuration</h4>
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="text-sm text-gray-300">Delta SMA Length</label>
+                  <input type="number" x-model.number="configs.deltaSMALength" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">Delta Spike Threshold</label>
+                  <input type="number" x-model.number="configs.deltaSpikeThreshold" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">Delta Surge Multiplier</label>
+                  <input type="number" step="0.01" x-model.number="configs.deltaSurgeMultiplier" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">Breakout Lookback Bars</label>
+                  <input type="number" x-model.number="configs.breakoutLookbackBars" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div class="col-span-2">
+                  <label class="text-sm text-gray-300">Delta Slope Exit Length</label>
+                  <input type="number" x-model.number="configs.deltaSlopeExitLength" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+              </div>
+            </div>
+
+            <!-- EMA / HTF -->
+            <div>
+              <h4 class="text-sm text-gray-400 mb-2">EMA / HTF</h4>
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="text-sm text-gray-300">EMA Length</label>
+                  <input type="number" x-model.number="configs.emaLength" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div class="flex items-end gap-2">
+                  <input id="useEmaFilter" type="checkbox" x-model="configs.useEmaFilter" @change="markDirty()"
+                         class="h-5 w-5 accent-blue-600 bg-gray-700 rounded"/>
+                  <label for="useEmaFilter" class="text-sm text-gray-300">Use EMA Filter</label>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">HTF EMA Length</label>
+                  <input type="number" x-model.number="configs.htfEMALength" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">Higher Timeframe (min)</label>
+                  <input type="number" x-model.number="configs.higherTimeframe" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div class="flex items-end gap-2 col-span-2">
+                  <input id="htfUseForming" type="checkbox" x-model="configs.htfUseForming" @change="markDirty()"
+                         class="h-5 w-5 accent-blue-600 bg-gray-700 rounded"/>
+                  <label for="htfUseForming" class="text-sm text-gray-300">HTF Forming Bar</label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right -->
+          <div class="space-y-6">
+            <!-- ATR & EXIT -->
+            <div>
+              <h4 class="text-sm text-gray-400 mb-2">ATR & Exit</h4>
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="text-sm text-gray-300">ATR Profit Multiplier</label>
+                  <input type="number" step="0.01" x-model.number="configs.atrProfitMultiplier" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">ATR Stop Loss Multiplier</label>
+                  <input type="number" step="0.01" x-model.number="configs.atrStopLossMultiplier" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">Min ATR to Trade</label>
+                  <input type="number" step="0.1" x-model.number="configs.minAtrToTrade" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">Min Bars Before Exit</label>
+                  <input type="number" x-model.number="configs.minBarsBeforeExit" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+              </div>
+            </div>
+
+            <!-- Trailing -->
+            <div>
+              <h4 class="text-sm text-gray-400 mb-2">Trailing Stop</h4>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="flex items-end gap-2 col-span-2">
+                  <input id="useTrailingStop" type="checkbox" x-model="configs.useTrailingStop" @change="markDirty()"
+                         class="h-5 w-5 accent-blue-600 bg-gray-700 rounded"/>
+                  <label for="useTrailingStop" class="text-sm text-gray-300">Use Trailing Stop</label>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">Trail Activation (ATR)</label>
+                  <input type="number" step="0.01" x-model.number="configs.trailActivationATR" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+                <div>
+                  <label class="text-sm text-gray-300">Trail Offset (ATR)</label>
+                  <input type="number" step="0.01" x-model.number="configs.trailOffsetATR" @input="markDirty()"
+                         class="mt-1 w-full p-2 bg-gray-700 rounded text-white"/>
+                </div>
+              </div>
+            </div>
+
+            <!-- Actions -->
+            <div class="flex items-center gap-3 pt-2">
+              <button @click="applyConfig()" :disabled="!dirty || !selectedAccountId || busy"
+                      class="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700 disabled:opacity-50">Apply</button>
+              <button @click="revertConfig()" :disabled="!dirty || busy"
+                      class="px-4 py-2 bg-gray-700 rounded hover:bg-gray-600 disabled:opacity-50">Revert</button>
+              <div class="text-xs text-gray-400" x-text="version ? `version: ${version}` : ''"></div>
+            </div>
+            <div class="text-sm text-gray-400" x-text="statusMsg"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- MONITOR -->
+      <section x-show="activeTab==='monitor'" x-cloak class="bg-gray-800 rounded-xl p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-base font-semibold">Trade Monitor</h3>
+          <button @click="refreshTrades()" class="px-3 py-1 bg-gray-700 rounded hover:bg-gray-600 text-sm">Refresh</button>
+        </div>
+        <div class="overflow-auto">
+          <table class="w-full text-sm">
+            <thead class="text-left text-gray-300">
+              <tr>
+                <th class="p-2">Time</th>
+                <th class="p-2">Side</th>
+                <th class="p-2">Qty</th>
+                <th class="p-2">Price</th>
+                <th class="p-2">Status</th>
+                <th class="p-2">PnL</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="t in trades" :key="t.id">
+                <tr class="border-t border-gray-700">
+                  <td class="p-2" x-text="new Date(t.entryTime ?? t.timestamp).toLocaleString()"></td>
+                  <td class="p-2" x-text="t.side ?? '-'"></td>
+                  <td class="p-2" x-text="t.qty ?? t.quantity ?? '-'"></td>
+                  <td class="p-2" x-text="t.entryPrice ?? t.price ?? '-'"></td>
+                  <td class="p-2" x-text="t.status ?? '-'"></td>
+                  <td class="p-2" x-text="t.pnl ?? '-'"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    function mnqApp() {
+      const BASE = 'http://localhost:4001';
+      const API = (p, opts={}) => fetch(`${BASE}${p}`, opts);
+
+      return {
+        activeTab: 'config',
+        accounts: [],
+        selectedAccountId: '',
+        activeAccountSummary: '',
+        isTrading: false,
+        busy: false,
+        dirty: false,
+        statusMsg: '',
+        trades: [],
+        version: '',
+
+        // FULL config set (as you listed)
+        configs: {
+          // TIME FILTER
+          tradingStartTime: '09:30',
+          tradingEndTime:   '16:00',
+
+          // DELTA CONFIGURATION
+          deltaSMALength: 20,
+          deltaSpikeThreshold: 450,
+          deltaSurgeMultiplier: 1.4,
+          breakoutLookbackBars: 20,
+          deltaSlopeExitLength: 3,
+
+          // EMA CONFIGURATION
+          emaLength: 9,
+          useEmaFilter: true,
+          htfEMALength: 9,
+          higherTimeframe: 15,
+          htfUseForming: true,
+
+          // ATR & EXIT CONFIGURATION
+          atrProfitMultiplier: 1.0,
+          atrStopLossMultiplier: 1.0,
+          minAtrToTrade: 9,
+          minBarsBeforeExit: 0,
+
+          // TRAILING STOP CONFIGURATION
+          useTrailingStop: true,
+          trailActivationATR: 0.3,
+          trailOffsetATR: 0.125,
+
+          // POSITION SIZING
+          contractQuantity: 1
+        },
+
+        init() {
+          this.loadAccounts();
+          this.fetchConfig();
+          this.fetchStatus();
+        },
+
+        markDirty(){ this.dirty = true; },
+
+        async loadAccounts() {
+          try {
+            const r = await API('/api/accounts');
+            const data = await r.json();
+            this.accounts = Array.isArray(data) ? data : [];
+            if (this.selectedAccountId) {
+              const found = this.accounts.find(a => (a.id ?? a.accountId ?? a.accountNumber) == this.selectedAccountId);
+              if (!found) this.selectedAccountId = '';
+            }
+          } catch(e) {
+            console.error('accounts error', e);
+          }
+        },
+
+        confirmAccount() {
+          const a = this.accounts.find(x => (x.id ?? x.accountId ?? x.accountNumber) == this.selectedAccountId);
+          this.activeAccountSummary = a ? (a.name ?? a.accountNumber ?? a.id) : '';
+        },
+
+        clearAccount() {
+          this.selectedAccountId = '';
+          this.activeAccountSummary = '';
+        },
+
+        async fetchConfig() {
+          try {
+            const r = await API('/api/strategy/config');
+            if (!r.ok) return;
+            const etag = r.headers.get('ETag');
+            const body = await r.json();
+            if (body?.effective) {
+              this.configs = { ...this.configs, ...body.effective };
+            }
+            this.version = etag || body?.version || '';
+            this.dirty = false;
+          } catch(e) {
+            console.error('config error', e);
+          }
+        },
+
+        async applyConfig() {
+          if (!this.dirty) return;
+          this.busy = true; this.statusMsg = 'Applying…';
+          try {
+            const payload = {
+              // time + sizing
+              tradingStartTime: this.configs.tradingStartTime,
+              tradingEndTime: this.configs.tradingEndTime,
+              contractQuantity: this.configs.contractQuantity,
+
+              // delta
+              deltaSMALength: this.configs.deltaSMALength,
+              deltaSpikeThreshold: this.configs.deltaSpikeThreshold,
+              deltaSurgeMultiplier: this.configs.deltaSurgeMultiplier,
+              breakoutLookbackBars: this.configs.breakoutLookbackBars,
+              deltaSlopeExitLength: this.configs.deltaSlopeExitLength,
+
+              // ema / htf
+              emaLength: this.configs.emaLength,
+              useEmaFilter: this.configs.useEmaFilter,
+              htfEMALength: this.configs.htfEMALength,
+              higherTimeframe: this.configs.higherTimeframe,
+              htfUseForming: this.configs.htfUseForming,
+
+              // atr & exit
+              atrProfitMultiplier: this.configs.atrProfitMultiplier,
+              atrStopLossMultiplier: this.configs.atrStopLossMultiplier,
+              minAtrToTrade: this.configs.minAtrToTrade,
+              minBarsBeforeExit: this.configs.minBarsBeforeExit,
+
+              // trailing
+              useTrailingStop: this.configs.useTrailingStop,
+              trailActivationATR: this.configs.trailActivationATR,
+              trailOffsetATR: this.configs.trailOffsetATR
+            };
+
+            const r = await API('/api/strategy/config', {
+              method: 'PUT',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(this.version ? {'If-Match': this.version} : {})
+              },
+              body: JSON.stringify(payload)
+            });
+
+            if (r.status === 412) {
+              this.statusMsg = 'Config changed on server. Refreshing…';
+              await this.fetchConfig();
+              return;
+            }
+            const etag = r.headers.get('ETag');
+            const body = await r.json();
+            if (r.ok && body?.effective) {
+              this.configs = { ...this.configs, ...body.effective };
+              this.version = etag || body?.version || this.version;
+              this.dirty = false;
+              this.statusMsg = 'Applied.';
+            } else {
+              this.statusMsg = body?.message || 'Apply failed.';
+            }
+          } catch(e) {
+            console.error('apply error', e);
+            this.statusMsg = 'Apply error.';
+          } finally {
+            this.busy = false;
+          }
+        },
+
+        async revertConfig() {
+          await this.fetchConfig();
+          this.statusMsg = 'Reverted.';
+        },
+
+        async fetchStatus() {
+          try {
+            const r = await API('/api/strategy/status');
+            const b = await r.json();
+            this.isTrading = !!b?.running;
+          } catch(e) {
+            console.error('status error', e);
+          }
+        },
+
+        async startStrategy() {
+          if (!this.selectedAccountId) return;
+          this.busy = true;
+          try {
+            const r = await API('/api/strategy/start', {
+              method: 'POST',
+              headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ accountId: this.selectedAccountId })
+            });
+            const b = await r.json();
+            if (r.ok && b?.success) {
+              this.isTrading = true;
+              this.statusMsg = 'Strategy started.';
+            } else {
+              this.statusMsg = b?.message || 'Start failed.';
+            }
+          } catch(e) {
+            console.error('start error', e);
+            this.statusMsg = 'Start error.';
+          } finally {
+            this.busy = false;
+          }
+        },
+
+        async stopStrategy() {
+          this.busy = true;
+          try {
+            const r = await API('/api/strategy/stop', { method:'POST' });
+            const b = await r.json();
+            if (r.ok && b?.success) {
+              this.isTrading = false;
+              this.statusMsg = 'Strategy stopped.';
+            } else {
+              this.statusMsg = b?.message || 'Stop failed.';
+            }
+          } catch(e) {
+            console.error('stop error', e);
+            this.statusMsg = 'Stop error.';
+          } finally {
+            this.busy = false;
+          }
+        },
+
+        async refreshTrades() {
+          try {
+            const r = await API('/api/trades?limit=200');
+            const b = await r.json();
+            this.trades = Array.isArray(b) ? b : [];
+          } catch(e) {
+            console.error('trades error', e);
+          }
+        }
+      };
+    }
+  </script>
+</body>
+</html>

@@ -5,7 +5,7 @@ import { TechnicalCalculator } from '../../utils/technical';
 console.log('[calc] loaded', __filename);
 
 export class MNQDeltaTrendCalculator {
-  private readonly config: Readonly<StrategyConfig>;
+  private config: StrategyConfig;
   private technical: TechnicalCalculator;
 
   // Closed bars storage
@@ -30,7 +30,7 @@ export class MNQDeltaTrendCalculator {
   private lastHTFBucketStartMs: number | null = null;
 
   constructor(config: StrategyConfig) {
-    this.config = Object.freeze(JSON.parse(JSON.stringify(config)));
+    this.config = config;
     this.technical = new TechnicalCalculator();
     console.info('[MNQDeltaTrend][Config:Calculator]', this.config);
   }

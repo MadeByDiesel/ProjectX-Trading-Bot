@@ -16,7 +16,7 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   deltaSlopeExitLength: 3,     
 
   // === EMA CONFIGURATION ===
-  emaLength: 9,            
+  emaLength: 21,            
   useEmaFilter: true,       
   htfEMALength: 9,
   higherTimeframe: 15,
@@ -34,7 +34,7 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   trailOffsetATR: 0.125,
 
   // === POSITION SIZING ===
-  contractQuantity: 1,
+  contractQuantity: 3,
 
   // === RISK MANAGEMENT ===
   dailyProfitTarget: 1500,
@@ -45,5 +45,5 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   deltaScale: 1,   
 
   sendWebhook: false,
-  webhookUrl: 'http://192.168.4.170:8080/signal?secret=toast',
+  webhookUrl: '' //'http://192.168.4.170:8080/signal?secret=toast',
 };

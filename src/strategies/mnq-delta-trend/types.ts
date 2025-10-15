@@ -45,6 +45,13 @@ export interface StrategyConfig {
   htfUseForming?: boolean; 
   sendWebhook: boolean;     // toggle sending webhooks
   webhookUrl: string;       // destination URL (empty => disabled)
+  
+   // Intra-bar detection settings
+  useIntraBarDetection?: boolean;           // Enable/disable intra-bar signals
+  intraBarCheckIntervalMs?: number;         // How often to check during bar (default: 100ms)
+  intraBarMinAccumulationMs?: number;       // Min time before first check (default: 5000ms = 5 seconds)
+  intraBarConfirmationChecks?: number;      // Consecutive checks required (default: 3)
+  intraBarConfirmationWindowMs?: number;    // Time window for confirmations (default: 500ms)
 }
 
 // === Bar / Market / Signal types used by calculator & trader ===

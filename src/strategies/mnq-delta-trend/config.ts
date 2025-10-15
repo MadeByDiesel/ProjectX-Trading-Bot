@@ -44,6 +44,13 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   requireDelta: true,                // set true only if you MUST have true delta from feed
   deltaScale: 1,   
 
+  // Intra-bar detection settings
+  useIntraBarDetection: true,              // Enable intra-bar signals
+  intraBarCheckIntervalMs: 150,            // Check every 100ms
+  intraBarMinAccumulationMs: 5000,         // Wait 5 seconds before first check
+  intraBarConfirmationChecks: 3,           // Require 3 consecutive confirmations
+  intraBarConfirmationWindowMs: 500,       // Within 500ms window
+
   sendWebhook: false,
   webhookUrl: '' //'http://192.168.4.170:8080/signal?secret=toast',
 };

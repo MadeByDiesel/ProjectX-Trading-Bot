@@ -42,6 +42,8 @@ export class MNQDeltaTrendTrader {
 
   /** Post trade events to the local NT8 webhook listener (curl-based, no deps) */
   private async postWebhook(action: 'BUY' | 'SELL' | 'FLAT', qty?: number): Promise<void> {
+    // honor config switch
+    if (!this.config?.sendWebhook) return;
     const base = this.config.webhookUrl || '';
     if (!base) return;
 
@@ -203,7 +205,9 @@ export class MNQDeltaTrendTrader {
             this.calculator.clearPosition();
             this.isFlattening = false;
 
-            this.postWebhook('FLAT');
+            if (this.config.sendWebhook) {
+              this.postWebhook('FLAT');
+            }
 
           })
           .catch((err) => {
@@ -357,7 +361,10 @@ export class MNQDeltaTrendTrader {
 
       // ✅ Send ENTRY webhook only after order success
       try {
-        this.postWebhook(signal.signal === 'buy' ? 'BUY' : 'SELL', qty);
+        // after order success
+        if (this.config.sendWebhook) {
+          this.postWebhook(signal.signal === 'buy' ? 'BUY' : 'SELL', qty);
+        }
       } catch (err) {
         console.error('[webhook] entry post failed', err);
       }

@@ -320,9 +320,15 @@ export class MNQDeltaTrendTrader {
     // Calculate how long this bar has been forming
     const accumulationTimeMs = nowMs - this.liveBarStartMs;
 
-    // Get current accumulated delta
-    const currentDelta = this.signedVolInBarByContract.get(this.contractId) ?? 0;
+    // Get last CLOSED bar's close price
+    const lastClosedBars = (this.calculator as any).bars3min;
+    const prevClose = lastClosedBars?.length ? lastClosedBars[lastClosedBars.length - 1].close : null;
+
+    // Calculate delta Pine-style: entire volume directional
     const currentVolume = this.volInBarByContract.get(this.contractId) ?? 0;
+    const currentDelta = (prevClose !== null && Number.isFinite(prevClose))
+      ? (currentPrice > prevClose ? currentVolume : currentPrice < prevClose ? -currentVolume : 0)
+      : 0;
 
     // Build forming bar snapshot
     const formingBar: BarData = {

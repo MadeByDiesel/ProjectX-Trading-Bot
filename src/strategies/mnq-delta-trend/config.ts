@@ -51,6 +51,6 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   intraBarConfirmationChecks: 3,           // Require 3 consecutive confirmations
   intraBarConfirmationWindowMs: 500,       // Within 500ms window
 
-  sendWebhook: false,
-  webhookUrl: '' //'http://192.168.4.170:8080/signal?secret=toast',
+  sendWebhook: true,
+  webhookUrl: 'http://192.168.4.170:8080/signal?secret=toast' //'http://192.168.4.170:8080/signal?secret=toast',
 };

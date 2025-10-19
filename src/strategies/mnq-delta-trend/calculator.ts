@@ -576,7 +576,7 @@ export class MNQDeltaTrendCalculator {
 
     const passDeltaLong = (delta > spike && delta > longThreshold && allConfirmLong);
     const passDeltaShort = (delta < -spike && delta < shortThreshold && allConfirmShort);
-
+    
     console.debug('[MNQDeltaTrend][formingBarCheck]', {
       delta,
       absDelta,

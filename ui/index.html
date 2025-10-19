@@ -295,17 +295,17 @@
         configs: {
           // TIME FILTER
           tradingStartTime: '09:30',
-          tradingEndTime:   '16:00',
+          tradingEndTime:   '15:50',
 
           // DELTA CONFIGURATION
           deltaSMALength: 20,
           deltaSpikeThreshold: 450,
-          deltaSurgeMultiplier: 1.4,
+          deltaSurgeMultiplier: 1.8,
           breakoutLookbackBars: 20,
           deltaSlopeExitLength: 3,
 
           // EMA CONFIGURATION
-          emaLength: 9,
+          emaLength: 21,
           useEmaFilter: true,
           htfEMALength: 9,
           higherTimeframe: 15,
@@ -319,7 +319,7 @@
 
           // TRAILING STOP CONFIGURATION
           useTrailingStop: true,
-          trailActivationATR: 0.3,
+          trailActivationATR: 0.125,
           trailOffsetATR: 0.125,
 
           // POSITION SIZING

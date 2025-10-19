@@ -6,11 +6,11 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
 
   // === TIME FILTER ===
   tradingStartTime: '09:30',
-  tradingEndTime:   '16:00',
+  tradingEndTime:   '15:50',
 
   // === DELTA CONFIGURATION (force easy entry) ===
   deltaSMALength: 20,           
-  deltaSpikeThreshold: 900,   // 450 base 
+  deltaSpikeThreshold: 450,   // 450 base 
   deltaSurgeMultiplier: 1.8,  // 1.4 base
   breakoutLookbackBars: 20,   // 20 base 
   deltaSlopeExitLength: 3,     
@@ -24,8 +24,8 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
 
   // === ATR & EXIT CONFIGURATION ===
   atrProfitMultiplier: 1.0,    
-  atrStopLossMultiplier: 0.75,  //0.3-0.5
-  minAtrToTrade: 12,        
+  atrStopLossMultiplier: 1.0,  //0.3-0.5
+  minAtrToTrade: 9,        
   minBarsBeforeExit: 0,
 
   // === TRAILING STOP CONFIGURATION ===

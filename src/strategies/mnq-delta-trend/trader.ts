@@ -12,6 +12,20 @@ export class MNQDeltaTrendTrader {
 
   private contractId: string;
   private symbol: string;
+  private deltaHistory: Array<{ value: number; timestamp: number }> = [];
+  private accelCountL = 0;  // NEW
+  private accelCountS = 0;  // NEW
+
+  // --- NEW: flatten & webhook dedupe + broker throttling ---
+  private lastFlatAtMs = 0;
+  private flatCooldownMs = 1500; // 1.5s single-flight window
+
+  private lastWebhookAt: Record<'BUY'|'SELL'|'FLAT', number> = { BUY: 0, SELL: 0, FLAT: 0 };
+  private webhookMinGapMs = 800; // dedupe same webhook within this gap
+
+  private equityCache = { ts: 0, val: 0 };
+  private equityTtlMs = 4000;     // cache equity 4s
+  private backoffUntilMs = 0;     // broker 429 backoff
 
   // Tick → bar accumulators
   private lastPriceByContract = new Map<string, number>();
@@ -53,6 +67,12 @@ export class MNQDeltaTrendTrader {
   /** Post trade events to the local NT8 webhook listener */
   private async postWebhook(action: 'BUY' | 'SELL' | 'FLAT', qty?: number): Promise<void> {
     if (!this.config?.sendWebhook) return;
+
+    // --- NEW: dedupe identical webhook within a short gap ---
+    const now = Date.now();
+    if (now - this.lastWebhookAt[action] < this.webhookMinGapMs) return;
+    this.lastWebhookAt[action] = now;
+
     const base = this.config.webhookUrl || '';
     if (!base) return;
 
@@ -100,6 +120,20 @@ export class MNQDeltaTrendTrader {
         }
       );
     });
+  }
+
+  // --- NEW: broker-safe equity fetch with cache & backoff ---
+  private async getEquitySafe(): Promise<number> {
+    const now = Date.now();
+    if (now < this.backoffUntilMs) throw new Error('broker-backoff');
+
+    if (now - this.equityCache.ts < this.equityTtlMs && this.equityCache.val > 0) {
+      return this.equityCache.val;
+    }
+
+    const eq = await this.client.getEquity(); // may throw / 429 upstream
+    this.equityCache = { ts: now, val: Number(eq) || 0 };
+    return this.equityCache.val;
   }
 
   constructor(opts: {
@@ -183,27 +217,62 @@ export class MNQDeltaTrendTrader {
     this.lastCumVolByContract.set(contractId, cumVol);
 
     // Tick-level protective exits (stop/trail)
-    if (this.calculator.hasPosition() && !this.isFlattening) {
+    // if (this.calculator.hasPosition() && !this.isFlattening) {
+    //   const hit = this.calculator.onTickForProtectiveStops(px, this.marketState.atr ?? 0);
+    //   if (hit === 'hitStop' || hit === 'hitTrail') {
+    //     const dir = this.calculator.getPositionDirection();
+    //     console.info(
+    //       `[MNQDeltaTrend][EXIT] ${hit} (tick) { px: ${px}, atr: ${this.marketState.atr}, dir: ${dir} }`
+    //     );
+
+    //     this.isFlattening = true;
+    //     this.client.closePosition(this.contractId)
+    //       .then(() => {
+    //         console.info('[MNQDeltaTrend][EXIT] flattened via closePosition');
+    //         this.calculator.clearPosition();
+    //         this.isFlattening = false;
+
+    //         if (this.config.sendWebhook) {
+    //           this.postWebhook('FLAT');
+    //         }
+    //       })
+    //       .catch((err) => {
+    //         console.error('[MNQDeltaTrend][EXIT] flatten failed:', err);
+    //         this.isFlattening = false;
+    //       });
+    //   }
+    // }
+    if (this.calculator.hasPosition()) {
       const hit = this.calculator.onTickForProtectiveStops(px, this.marketState.atr ?? 0);
       if (hit === 'hitStop' || hit === 'hitTrail') {
+        const now = Date.now();
+        // --- NEW: single-flight & cooldown guard ---
+        if (this.isFlattening || (now - this.lastFlatAtMs) < this.flatCooldownMs) return;
+
+        this.isFlattening = true;
+        this.lastFlatAtMs = now;
+
         const dir = this.calculator.getPositionDirection();
         console.info(
           `[MNQDeltaTrend][EXIT] ${hit} (tick) { px: ${px}, atr: ${this.marketState.atr}, dir: ${dir} }`
         );
 
-        this.isFlattening = true;
-        this.client.closePosition(this.contractId)
+        // --- NEW: timeout race to avoid hanging ---
+        const closeP = this.client.closePosition(this.contractId);
+        const timeoutP = new Promise<void>((_, rej) => setTimeout(() => rej(new Error('flatten-timeout')), 2500));
+
+        Promise.race([closeP, timeoutP])
           .then(() => {
             console.info('[MNQDeltaTrend][EXIT] flattened via closePosition');
             this.calculator.clearPosition();
-            this.isFlattening = false;
-
-            if (this.config.sendWebhook) {
-              this.postWebhook('FLAT');
-            }
+            if (this.config.sendWebhook) this.postWebhook('FLAT');
           })
           .catch((err) => {
-            console.error('[MNQDeltaTrend][EXIT] flatten failed:', err);
+            console.error('[MNQDeltaTrend][EXIT] flatten failed/timeout:', err?.message ?? err);
+            // Clear local state to avoid repeated FLAT storms in chop
+            try { this.calculator.clearPosition(); } catch {}
+          })
+          .finally(() => {
             this.isFlattening = false;
           });
       }
@@ -250,6 +319,9 @@ export class MNQDeltaTrendTrader {
       
       // Reset calculator's intra-bar tracking
       this.calculator.resetIntraBarTracking();
+      this.deltaHistory = []; // ADD HERE
+      this.accelCountL = 0;   // NEW
+      this.accelCountS = 0;   // NEW
       
       console.debug(`[MNQDeltaTrend][barOpen] ${new Date(this.barStartMs).toISOString()} O=${px}`);
       return;
@@ -299,6 +371,9 @@ export class MNQDeltaTrendTrader {
       this.enteredBarStartMs = null;
       
       this.calculator.resetIntraBarTracking();
+      this.deltaHistory = []; // ADD HERE
+      this.accelCountL = 0;   // NEW
+      this.accelCountS = 0;   // NEW
       
       console.debug(`[MNQDeltaTrend][barOpen:HB] ${new Date(this.barStartMs).toISOString()} O=${lastPx}`);
     }
@@ -312,25 +387,50 @@ export class MNQDeltaTrendTrader {
       return;
     }
 
-    // Per-bar entry limit: only one entry per 3-minute bar
+    // Per-bar entry limit
     if (this.enteredBarStartMs === this.barStartMs) {
-      return; // Already entered on this bar
+      return;
     }
 
-    // Calculate how long this bar has been forming
     const accumulationTimeMs = nowMs - this.liveBarStartMs;
-
-    // Get last CLOSED bar's close price
-    const lastClosedBars = (this.calculator as any).bars3min;
-    const prevClose = lastClosedBars?.length ? lastClosedBars[lastClosedBars.length - 1].close : null;
-
-    // Calculate delta Pine-style: entire volume directional
+    const currentDelta = this.signedVolInBarByContract.get(this.contractId) ?? 0;
     const currentVolume = this.volInBarByContract.get(this.contractId) ?? 0;
-    const currentDelta = (prevClose !== null && Number.isFinite(prevClose))
-      ? (currentPrice > prevClose ? currentVolume : currentPrice < prevClose ? -currentVolume : 0)
-      : 0;
 
-    // Build forming bar snapshot
+    // === DELTA ACCELERATION FILTER (FINAL) ===
+    // 1) push current directional sample FIRST
+    this.deltaHistory.push({ value: currentDelta, timestamp: nowMs });
+    // 2) keep last ~1.2s / 5 points
+    this.deltaHistory = this.deltaHistory
+      .filter(e => (nowMs - e.timestamp) <= 1200)
+      .slice(-5);
+
+    // need ≥3 points
+    if (this.deltaHistory.length < 3) return;
+
+    const p2 = this.deltaHistory[this.deltaHistory.length - 3];
+    const p1 = this.deltaHistory[this.deltaHistory.length - 2];
+    const p0 = this.deltaHistory[this.deltaHistory.length - 1];
+
+    const dt1s = Math.max(0.10, (p1.timestamp - p2.timestamp) / 1000);
+    const dt0s = Math.max(0.10, (p0.timestamp - p1.timestamp) / 1000);
+
+    const v1 = (p1.value - p2.value) / dt1s; // delta/sec
+    const v0 = (p0.value - p1.value) / dt0s; // delta/sec
+    const a  = v0 - v1;                      // delta/sec^2
+
+    const MIN_VEL = 300;
+    const HYST    = 50;
+
+    let accelOkLong  = (v0 >  MIN_VEL) && (a >  HYST);
+    let accelOkShort = (v0 < -MIN_VEL) && (a < -HYST);
+
+    // stickiness: require ≥2 consecutive passes
+    this.accelCountL = accelOkLong  ? this.accelCountL + 1 : 0;
+    this.accelCountS = accelOkShort ? this.accelCountS + 1 : 0;
+    accelOkLong  = this.accelCountL >= 2;
+    accelOkShort = this.accelCountS >= 2;
+    // === END DELTA ACCELERATION FILTER ===
+
     const formingBar: BarData = {
       timestamp: new Date(this.barStartMs!).toISOString(),
       open: this.liveBarOpen,
@@ -341,14 +441,18 @@ export class MNQDeltaTrendTrader {
       delta: currentDelta,
     };
 
-    // Ask calculator to evaluate with safeguards
     const signal = this.calculator.evaluateFormingBar(
       formingBar,
       this.marketState as any,
       accumulationTimeMs
     );
 
-    // Only act on buy/sell signals
+    // Align accel filter with decided side
+    if ((signal.signal === 'buy'  && !accelOkLong) ||
+        (signal.signal === 'sell' && !accelOkShort)) {
+      return;
+    }
+    
     if (signal.signal === 'buy' || signal.signal === 'sell') {
       console.info(
         `[MNQDeltaTrend][INTRA-BAR SIGNAL] ${signal.signal.toUpperCase()}`,
@@ -388,22 +492,36 @@ export class MNQDeltaTrendTrader {
     try {
       const direction = signal.signal === 'buy' ? 'long' : 'short';
       const atr = this.marketState.atr ?? 0;
-      
-      const acctBal = await this.client.getEquity();
-      const qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));
 
-      console.info(
-        `[MNQDeltaTrend][INTRA-BAR ORDER] ${signal.signal.toUpperCase()} qty=${qty}`,
-        `confidence=${signal.confidence} bar=${new Date(this.barStartMs!).toISOString()}`
-      );
+      let qty = 1;
 
-      await this.client.createOrder({
-        contractId: this.contractId,
-        type: 2,
-        side: signal.signal === 'buy' ? 0 : 1,
-        size: qty,
-      });
+      try {
+        const acctBal = await this.getEquitySafe();
+        qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));
 
+        console.info(
+          `[MNQDeltaTrend][INTRA-BAR ORDER] ${signal.signal.toUpperCase()} qty=${qty}`,
+          `confidence=${signal.confidence} bar=${new Date(this.barStartMs!).toISOString()}`
+        );
+
+        await this.client.createOrder({
+          contractId: this.contractId,
+          type: 2,
+          side: signal.signal === 'buy' ? 0 : 1,
+          size: qty,
+        });
+      } catch (err: any) {
+        const msg = String(err?.message || err);
+        if (msg.includes('429') || msg.includes('backoff')) {
+          this.backoffUntilMs = Date.now() + 4000; // NEW: quiet period after rate-limit
+          console.warn('[rate-limit] backing off until', new Date(this.backoffUntilMs).toISOString());
+        }
+        // --- NEW: DO NOT retry this bar; keep the per-bar lock to avoid storms
+        this.enteredBarStartMs = this.barStartMs;
+        console.error('[MNQDeltaTrend][order] placement failed:', err);
+        return; // <-- swallow here since caller used `void`
+      }     
+ 
       // Mark this bar as entered
       this.enteredBarStartMs = this.barStartMs;
 
@@ -417,11 +535,16 @@ export class MNQDeltaTrendTrader {
         await this.postWebhook(signal.signal === 'buy' ? 'BUY' : 'SELL', qty);
       }
 
+    // } catch (err) {
+    //   console.error('[MNQDeltaTrend][INTRA-BAR ORDER] execution failed:', err);
+    //   // If order failed, allow retry on this bar
+    //   this.enteredBarStartMs = null;
+    // } finally {
     } catch (err) {
       console.error('[MNQDeltaTrend][INTRA-BAR ORDER] execution failed:', err);
-      // If order failed, allow retry on this bar
-      this.enteredBarStartMs = null;
-    } finally {
+      // NEW: keep lock — no same-bar retry (prevents bursts & 429s)
+      this.enteredBarStartMs = this.barStartMs;
+    } finally {    
       this.isEnteringPosition = false;
     }
   }
@@ -456,7 +579,7 @@ export class MNQDeltaTrendTrader {
 
     // Process bar-close signal (fallback if intra-bar didn't fire)
     const signal = this.calculator.processNewBar(closedBar as any, this.marketState as any);
-    this.handleSignal(signal, closedBar);
+    void this.handleSignal(signal, closedBar);
 
     console.debug(
       `[MNQDeltaTrend][barClose] t=${closedBar.timestamp} O:${closedBar.open} H:${closedBar.high} L:${closedBar.low} C:${closedBar.close} Δ:${closedBar.delta} V:${closedBar.volume}`
@@ -500,24 +623,38 @@ export class MNQDeltaTrendTrader {
       return;
     }
 
-    const direction = signal.signal === 'buy' ? 'long' : 'short';
-    const atr = this.marketState.atr ?? 0;
-    const acctBal = await this.client.getEquity();
-    const qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));
+    //   // Mark bar as entered
+    //   this.enteredBarStartMs = this.barStartMs;
+      const direction = signal.signal === 'buy' ? 'long' : 'short';
+      const atr = this.marketState.atr ?? 0;
 
-    console.info(`[MNQDeltaTrend][order] ${signal.signal.toUpperCase()} qty=${qty} reason="${signal.reason}"`);
+      let qty = 1;
+      try {
+        const acctBal = await this.getEquitySafe();
+        qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));
 
-    try {
-      await this.client.createOrder({
-        contractId: this.contractId,
-        type: 2,
-        side: signal.signal === 'buy' ? 0 : 1,
-        size: qty,
-      });
+        console.info(`[MNQDeltaTrend][order] ${signal.signal.toUpperCase()} qty=${qty} reason="${signal.reason}"`);
 
-      // Mark bar as entered
-      this.enteredBarStartMs = this.barStartMs;
+        await this.client.createOrder({
+          contractId: this.contractId,
+          type: 2,
+          side: signal.signal === 'buy' ? 0 : 1,
+          size: qty,
+        });
 
+        // Mark bar as entered
+        this.enteredBarStartMs = this.barStartMs;
+
+      } catch (err: any) {
+        const msg = String(err?.message || err);
+        if (msg.includes('429') || msg.includes('backoff')) {
+          this.backoffUntilMs = Date.now() + 4000;
+          console.warn('[rate-limit] backing off until', new Date(this.backoffUntilMs).toISOString());
+        }
+        // Do not retry same bar
+        this.enteredBarStartMs = this.barStartMs;
+        throw err;
+      }
       try {
         (this.calculator as any).setPosition?.(bar.close, direction, atr);
       } catch {}
@@ -526,8 +663,6 @@ export class MNQDeltaTrendTrader {
         this.postWebhook(signal.signal === 'buy' ? 'BUY' : 'SELL', qty);
       }
 
-    } catch (err) {
-      console.error('[MNQDeltaTrend][order] placement failed:', err);
-    }
+
   }
 }

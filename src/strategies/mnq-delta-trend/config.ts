@@ -11,7 +11,7 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   // === DELTA CONFIGURATION (force easy entry) ===
   deltaSMALength: 20,           
   deltaSpikeThreshold: 450,   // 450 base 
-  deltaSurgeMultiplier: 1.8,  // 1.8 base
+  deltaSurgeMultiplier: 1.8,  // 1.4 base
   breakoutLookbackBars: 20,   // 20 base 
   deltaSlopeExitLength: 3,     
 
@@ -50,7 +50,8 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   intraBarMinAccumulationMs: 5000,         // Wait 5 seconds before first check
   intraBarConfirmationChecks: 2,           // Require 3 consecutive confirmations
   intraBarConfirmationWindowMs: 500,       // Within 500ms window
+  disableBarCloseEntries: true,
 
-  sendWebhook: true,
+  sendWebhook: false,
   webhookUrl: 'http://192.168.4.170:8080/signal?secret=toast' //'http://192.168.4.170:8080/signal?secret=toast',
 };

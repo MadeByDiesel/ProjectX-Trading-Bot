@@ -579,7 +579,12 @@ export class MNQDeltaTrendTrader {
 
     // Process bar-close signal (fallback if intra-bar didn't fire)
     const signal = this.calculator.processNewBar(closedBar as any, this.marketState as any);
-    void this.handleSignal(signal, closedBar);
+    // Skip bar-close entries when intra-bar detection is on
+    if (this.config.useIntraBarDetection && this.config.disableBarCloseEntries !== false) {
+      console.debug('[MNQDeltaTrend][barClose] intra-bar enabled → skip bar-close entries');
+    } else {
+      void this.handleSignal(signal, closedBar);
+    }
 
     console.debug(
       `[MNQDeltaTrend][barClose] t=${closedBar.timestamp} O:${closedBar.open} H:${closedBar.high} L:${closedBar.low} C:${closedBar.close} Δ:${closedBar.delta} V:${closedBar.volume}`

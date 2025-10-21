@@ -12,9 +12,6 @@ export class MNQDeltaTrendTrader {
 
   private contractId: string;
   private symbol: string;
-  private deltaHistory: Array<{ value: number; timestamp: number }> = [];
-  private accelCountL = 0;  // NEW
-  private accelCountS = 0;  // NEW
 
   // --- NEW: flatten & webhook dedupe + broker throttling ---
   private lastFlatAtMs = 0;
@@ -319,10 +316,7 @@ export class MNQDeltaTrendTrader {
       
       // Reset calculator's intra-bar tracking
       this.calculator.resetIntraBarTracking();
-      this.deltaHistory = []; // ADD HERE
-      this.accelCountL = 0;   // NEW
-      this.accelCountS = 0;   // NEW
-      
+
       console.debug(`[MNQDeltaTrend][barOpen] ${new Date(this.barStartMs).toISOString()} O=${px}`);
       return;
     }
@@ -371,9 +365,6 @@ export class MNQDeltaTrendTrader {
       this.enteredBarStartMs = null;
       
       this.calculator.resetIntraBarTracking();
-      this.deltaHistory = []; // ADD HERE
-      this.accelCountL = 0;   // NEW
-      this.accelCountS = 0;   // NEW
       
       console.debug(`[MNQDeltaTrend][barOpen:HB] ${new Date(this.barStartMs).toISOString()} O=${lastPx}`);
     }
@@ -396,41 +387,6 @@ export class MNQDeltaTrendTrader {
     const currentDelta = this.signedVolInBarByContract.get(this.contractId) ?? 0;
     const currentVolume = this.volInBarByContract.get(this.contractId) ?? 0;
 
-    // === DELTA ACCELERATION FILTER (FINAL) ===
-    // 1) push current directional sample FIRST
-    this.deltaHistory.push({ value: currentDelta, timestamp: nowMs });
-    // 2) keep last ~1.2s / 5 points
-    this.deltaHistory = this.deltaHistory
-      .filter(e => (nowMs - e.timestamp) <= 1200)
-      .slice(-5);
-
-    // need ≥3 points
-    if (this.deltaHistory.length < 3) return;
-
-    const p2 = this.deltaHistory[this.deltaHistory.length - 3];
-    const p1 = this.deltaHistory[this.deltaHistory.length - 2];
-    const p0 = this.deltaHistory[this.deltaHistory.length - 1];
-
-    const dt1s = Math.max(0.10, (p1.timestamp - p2.timestamp) / 1000);
-    const dt0s = Math.max(0.10, (p0.timestamp - p1.timestamp) / 1000);
-
-    const v1 = (p1.value - p2.value) / dt1s; // delta/sec
-    const v0 = (p0.value - p1.value) / dt0s; // delta/sec
-    const a  = v0 - v1;                      // delta/sec^2
-
-    const MIN_VEL = 300;
-    const HYST    = 50;
-
-    let accelOkLong  = (v0 >  MIN_VEL) && (a >  HYST);
-    let accelOkShort = (v0 < -MIN_VEL) && (a < -HYST);
-
-    // stickiness: require ≥2 consecutive passes
-    this.accelCountL = accelOkLong  ? this.accelCountL + 1 : 0;
-    this.accelCountS = accelOkShort ? this.accelCountS + 1 : 0;
-    accelOkLong  = this.accelCountL >= 2;
-    accelOkShort = this.accelCountS >= 2;
-    // === END DELTA ACCELERATION FILTER ===
-
     const formingBar: BarData = {
       timestamp: new Date(this.barStartMs!).toISOString(),
       open: this.liveBarOpen,
@@ -447,12 +403,6 @@ export class MNQDeltaTrendTrader {
       accumulationTimeMs
     );
 
-    // Align accel filter with decided side
-    if ((signal.signal === 'buy'  && !accelOkLong) ||
-        (signal.signal === 'sell' && !accelOkShort)) {
-      return;
-    }
-    
     if (signal.signal === 'buy' || signal.signal === 'sell') {
       console.info(
         `[MNQDeltaTrend][INTRA-BAR SIGNAL] ${signal.signal.toUpperCase()}`,

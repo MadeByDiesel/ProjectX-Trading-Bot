@@ -52,9 +52,6 @@ export interface StrategyConfig {
   intraBarMinAccumulationMs?: number;       // Min time before first check (default: 5000ms = 5 seconds)
   intraBarConfirmationChecks?: number;      // Consecutive checks required (default: 3)
   intraBarConfirmationWindowMs?: number;    // Time window for confirmations (default: 500ms)
-
-    // --- NEW: control behavior of bar-close logic ---
-  disableBarCloseEntries?: boolean;   // default true when intra-bar is active
 }
 
 // === Bar / Market / Signal types used by calculator & trader ===

@@ -408,18 +408,32 @@ export class MNQDeltaTrendCalculator {
     const slDist = atr * (this.config.atrStopLossMultiplier ?? 1.0);
     const stopLoss = direction === 'long' ? entryPrice - slDist : entryPrice + slDist;
 
-    this.currentPosition = { entryPrice, entryTime: Date.now(), direction, stopLoss };
+    // --- PURE TRAILING MODE ---
+    const trailOff = atr * (this.config.trailOffsetATR ?? 0.125);
+    const initialTrail =
+      direction === 'long'
+        ? entryPrice - trailOff
+        : entryPrice + trailOff;
 
-    this.trailingStopLevel = stopLoss;
-    this.trailArmed = false;
-    this.noTrailBeforeMs = Date.now() + (((this as any).config?.tickExitGraceMs ?? 0) | 0);
+    // Remove ATR-based stop, trail governs everything
+    this.currentPosition = {
+      entryPrice,
+      entryTime: Date.now(),
+      direction,
+      stopLoss: initialTrail,  // keep field non-null for logging
+    };
 
-    console.info('[MNQDeltaTrend][ENTRY:init]', {
+    // Arm trail immediately, no grace delay
+    this.trailingStopLevel = initialTrail;
+    this.trailArmed = true;
+    this.noTrailBeforeMs = Date.now(); // disables delay
+
+    console.info('[MNQDeltaTrend][ENTRY:init:PURE-TRAIL]', {
       dir: direction,
       entry: entryPrice,
       atr,
-      stopLoss,
-      trailActivationMove: atr * (this.config.trailActivationATR ?? 1.5)
+      trailOff,
+      trailingStopLevel: this.trailingStopLevel
     });
   }
 
@@ -647,8 +661,6 @@ export class MNQDeltaTrendCalculator {
     if (!this.currentPosition || !Number.isFinite(lastPrice)) return 'none';
     const { direction: dir, entryPrice, stopLoss } = this.currentPosition;
 
-    if (dir === 'long' && lastPrice <= stopLoss) return 'hitStop';
-    if (dir === 'short' && lastPrice >= stopLoss) return 'hitStop';
     if (Date.now() < this.noTrailBeforeMs) return 'none';
 
     const atr = Number.isFinite(atrNow) && atrNow > 0 ? atrNow : this.calculateATR();

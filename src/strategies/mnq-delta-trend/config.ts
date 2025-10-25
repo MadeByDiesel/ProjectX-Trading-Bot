@@ -30,7 +30,7 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
 
   // === TRAILING STOP CONFIGURATION ===
   useTrailingStop: true,
-  trailActivationATR: 0.125,
+  trailActivationATR: 0,
   trailOffsetATR: 0.125,
 
   // === POSITION SIZING ===

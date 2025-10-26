@@ -251,16 +251,20 @@ export class MNQDeltaTrendCalculator {
 
   private checkExitConditions(bar: BarData, _marketState: MarketState): TradeSignal | null {
     if (!this.currentPosition) return null;
-    const { entryTime, direction, stopLoss } = this.currentPosition;
+
+    const { entryTime, direction } = this.currentPosition;
     const minBars = Math.max(0, this.config.minBarsBeforeExit ?? 0);
     const barsSinceEntry = this.bars3min.filter(b => new Date(b.timestamp).getTime() > entryTime).length;
     if (barsSinceEntry < minBars) return null;
 
-    if (direction === 'long' && bar.low <= stopLoss) {
-      return { signal: 'sell', reason: `Hit stop (${stopLoss.toFixed(2)})`, confidence: 1.0 };
+    const trail = this.trailingStopLevel;
+    if (!Number.isFinite(trail)) return null;
+
+    if (direction === 'long'  && bar.low  <= trail) {
+      return { signal: 'sell', reason: `Hit trail (${trail.toFixed(2)})`, confidence: 1.0 };
     }
-    if (direction === 'short' && bar.high >= stopLoss) {
-      return { signal: 'buy', reason: `Hit stop (${stopLoss.toFixed(2)})`, confidence: 1.0 };
+    if (direction === 'short' && bar.high >= trail) {
+      return { signal: 'buy',  reason: `Hit trail (${trail.toFixed(2)})`, confidence: 1.0 };
     }
     return null;
   }
@@ -403,37 +407,32 @@ export class MNQDeltaTrendCalculator {
     return Math.min(Math.max(1, size), this.config.contractQuantity ?? 1);
   }
 
-  public setPosition(entryPrice: number, direction: 'long' | 'short', atrForTrail?: number): void {
-    const atr = (typeof atrForTrail === 'number' && atrForTrail > 0) ? atrForTrail : (this.calculateATR() || 0);
-    const slDist = atr * (this.config.atrStopLossMultiplier ?? 1.0);
-    const stopLoss = direction === 'long' ? entryPrice - slDist : entryPrice + slDist;
+  public setPosition(entryPrice: number, direction: 'long' | 'short', _atrForTrail?: number): void {
+    const offPts = Number(this.config.trailOffsetATR ?? 1.25);
+    const actPts = Math.max(0, Number(this.config.trailActivationATR ?? 0));
 
-    // --- PURE TRAILING MODE ---
-    const trailOff = atr * (this.config.trailOffsetATR ?? 0.125);
-    const initialTrail =
-      direction === 'long'
-        ? entryPrice - trailOff
-        : entryPrice + trailOff;
-
-    // Remove ATR-based stop, trail governs everything
+    // Keep a value in stopLoss for logs, but the live trail may be armed later.
     this.currentPosition = {
       entryPrice,
       entryTime: Date.now(),
       direction,
-      stopLoss: initialTrail,  // keep field non-null for logging
+      stopLoss: direction === 'long' ? entryPrice - offPts : entryPrice + offPts,
     };
 
-    // Arm trail immediately, no grace delay
-    this.trailingStopLevel = initialTrail;
-    this.trailArmed = true;
-    this.noTrailBeforeMs = Date.now(); // disables delay
+    if (actPts === 0) {
+      // Arm immediately: trail live from tick one
+      this.trailArmed = true;
+      this.trailingStopLevel = (direction === 'long') ? (entryPrice - offPts) : (entryPrice + offPts);
+    } else {
+      // Not armed yet; we will set the trail on first arm
+      this.trailArmed = false;
+      this.trailingStopLevel = Number.NaN;
+    }
+
+    this.noTrailBeforeMs = Date.now();
 
     console.info('[MNQDeltaTrend][ENTRY:init:PURE-TRAIL]', {
-      dir: direction,
-      entry: entryPrice,
-      atr,
-      trailOff,
-      trailingStopLevel: this.trailingStopLevel
+      dir: direction, entry: entryPrice, offPts, actPts, trailingStopLevel: this.trailingStopLevel
     });
   }
 
@@ -657,38 +656,38 @@ export class MNQDeltaTrendCalculator {
     return this.currentPosition?.direction ?? null;
   }
 
-  public onTickForProtectiveStops(lastPrice: number, atrNow: number): 'none' | 'hitStop' | 'hitTrail' {
+  public onTickForProtectiveStops(lastPrice: number, _atrNow: number): 'none' | 'hitStop' | 'hitTrail' {
     if (!this.currentPosition || !Number.isFinite(lastPrice)) return 'none';
-    const { direction: dir, entryPrice, stopLoss } = this.currentPosition;
+    const { direction: dir, entryPrice } = this.currentPosition;
 
-    if (Date.now() < this.noTrailBeforeMs) return 'none';
+    // Interpret config values as fixed *points*, not ATR-multipliers
+    const offPts = Number(this.config.trailOffsetATR ?? 1.25);         // gap in points
+    const actPts = Math.max(0, Number(this.config.trailActivationATR ?? 0)); // activation distance in points
 
-    const atr = Number.isFinite(atrNow) && atrNow > 0 ? atrNow : this.calculateATR();
-    if (!Number.isFinite(atr) || atr <= 0) return 'none';
+    // Arm if not yet armed and move has reached activation distance
+    if (!this.trailArmed) {
+      if ((dir === 'long'  && (lastPrice - entryPrice) >= actPts) ||
+          (dir === 'short' && (entryPrice - lastPrice) >= actPts)) {
+        this.trailArmed = true;
+        // First arm: set trail directly from price
+        this.trailingStopLevel = (dir === 'long') ? (lastPrice - offPts) : (lastPrice + offPts);
+        this.currentPosition.stopLoss = this.trailingStopLevel; // keep logs aligned
+      } else {
+        return 'none';
+      }
+    }
 
-    const act = atr * (this.config.trailActivationATR ?? 1.5);
-    const off = atr * (this.config.trailOffsetATR ?? 1.0);
-
+    // Update trail while armed
     if (dir === 'long') {
-      if (!this.trailArmed && (lastPrice - entryPrice) >= act) {
-        this.trailArmed = true;
-        this.trailingStopLevel = Math.max(stopLoss, lastPrice - off);
-      }
-      if (this.trailArmed) {
-        const candidate = Math.max(stopLoss, lastPrice - off);
-        if (candidate > this.trailingStopLevel) this.trailingStopLevel = candidate;
-        if (lastPrice <= this.trailingStopLevel) return 'hitTrail';
-      }
+      const candidate = lastPrice - offPts;
+      if (candidate > this.trailingStopLevel) this.trailingStopLevel = candidate;
+      this.currentPosition.stopLoss = this.trailingStopLevel;
+      if (lastPrice <= this.trailingStopLevel) return 'hitTrail';
     } else {
-      if (!this.trailArmed && (entryPrice - lastPrice) >= act) {
-        this.trailArmed = true;
-        this.trailingStopLevel = Math.min(stopLoss, lastPrice + off);
-      }
-      if (this.trailArmed) {
-        const candidate = Math.min(stopLoss, lastPrice + off);
-        if (candidate < this.trailingStopLevel) this.trailingStopLevel = candidate;
-        if (lastPrice >= this.trailingStopLevel) return 'hitTrail';
-      }
+      const candidate = lastPrice + offPts;
+      if (candidate < this.trailingStopLevel) this.trailingStopLevel = candidate;
+      this.currentPosition.stopLoss = this.trailingStopLevel;
+      if (lastPrice >= this.trailingStopLevel) return 'hitTrail';
     }
     return 'none';
   }

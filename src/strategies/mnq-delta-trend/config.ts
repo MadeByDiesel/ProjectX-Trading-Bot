@@ -47,7 +47,7 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   // Intra-bar detection settings
   useIntraBarDetection: true,              // Enable intra-bar signals
   intraBarCheckIntervalMs: 100,            // Check every 100ms
-  intraBarMinAccumulationMs: 0,         // Wait 5 seconds before first check
+  intraBarMinAccumulationMs: 0,             // Wait 5 seconds before first check
   intraBarConfirmationChecks: 3,           // Require 3 consecutive confirmations
   intraBarConfirmationWindowMs: 800,       // Within 500ms window
 

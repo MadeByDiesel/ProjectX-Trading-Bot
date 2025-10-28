@@ -22,6 +22,11 @@ export class MNQDeltaTrendCalculator {
     stopLoss: number;
   } | null = null;
 
+  // Frozen per-trade trail distances (computed at entry from ATR(entry))
+  private fixedTrail: { offPts: number; actPts: number; entryATR: number } | null = null;
+    // …existing fields…
+  private lastAtrAtSignal: number | null = null;
+
   private trailingStopLevel = 0;
   private trailArmed = false;
   private noTrailBeforeMs = 0;
@@ -370,9 +375,9 @@ export class MNQDeltaTrendCalculator {
       if (this.config.useEmaFilter && !passLong) {
         return { signal: 'hold', reason: 'LTF EMA long filter not passed', confidence: 0 };
       }
-      
       this.lastEntryBarTimestamp = bar.timestamp;
-      
+      this.lastAtrAtSignal = atr;                           // <-- ADD THIS LINE
+
       return { 
         signal: 'buy', 
         reason: `Δ=${delta.toFixed(0)} > spike=${spike} & > SMA×mult=${(deltaSMA * surgeMult).toFixed(0)}, bullish HTF, breakout`, 
@@ -385,9 +390,9 @@ export class MNQDeltaTrendCalculator {
       if (this.config.useEmaFilter && !passShort) {
         return { signal: 'hold', reason: 'LTF EMA short filter not passed', confidence: 0 };
       }
-      
       this.lastEntryBarTimestamp = bar.timestamp;
-      
+      this.lastAtrAtSignal = atr;                           // <-- ADD THIS LINE
+
       return { 
         signal: 'sell', 
         reason: `Δ=${delta.toFixed(0)} < -spike=${-spike} & < SMA×(-mult)=${(deltaSMA * -surgeMult).toFixed(0)}, bearish HTF, breakdown`, 
@@ -408,10 +413,31 @@ export class MNQDeltaTrendCalculator {
   }
 
   public setPosition(entryPrice: number, direction: 'long' | 'short', _atrForTrail?: number): void {
-    const offPts = Number(this.config.trailOffsetATR ?? 1.25);
-    const actPts = Math.max(0, Number(this.config.trailActivationATR ?? 0));
+    // Prefer explicit ATR from caller; else use the stashed ATR captured at signal time; else compute.
+    const atrFromCaller = Number.isFinite(_atrForTrail as number) ? Number(_atrForTrail) : NaN;
+    const atrFromStash  = Number.isFinite(this.lastAtrAtSignal as number) ? Number(this.lastAtrAtSignal) : NaN;
+    const computedATR   = this.calculateATR();
 
-    // Keep a value in stopLoss for logs, but the live trail may be armed later.
+    const atrAtEntry =
+      Number.isFinite(atrFromCaller) ? atrFromCaller :
+      Number.isFinite(atrFromStash)  ? atrFromStash  :
+      computedATR;
+
+    if (!Number.isFinite(atrAtEntry) || atrAtEntry <= 0) {
+      console.warn('[MNQDeltaTrend][ENTRY] Aborted: invalid ATR at entry', { atrAtEntry });
+      return;
+    }
+
+    // Treat config values as ATR multipliers (Pine parity)
+    const offMult = Number(this.config.trailOffsetATR ?? 0.125);
+    const actMult = Math.max(0, Number(this.config.trailActivationATR ?? 0.30));
+
+    const offPts = atrAtEntry * offMult;
+    const actPts = atrAtEntry * actMult;
+
+    this.fixedTrail = { offPts, actPts, entryATR: atrAtEntry };
+
+    // Initialize position; initial SL for logs (live trail may arm later)
     this.currentPosition = {
       entryPrice,
       entryTime: Date.now(),
@@ -419,20 +445,22 @@ export class MNQDeltaTrendCalculator {
       stopLoss: direction === 'long' ? entryPrice - offPts : entryPrice + offPts,
     };
 
-    if (actPts === 0) {
-      // Arm immediately: trail live from tick one
-      this.trailArmed = true;
-      this.trailingStopLevel = (direction === 'long') ? (entryPrice - offPts) : (entryPrice + offPts);
-    } else {
-      // Not armed yet; we will set the trail on first arm
-      this.trailArmed = false;
-      this.trailingStopLevel = Number.NaN;
-    }
+    // Always arm immediately (Pine-style); trail exists from tick 1
+    this.trailArmed = true;
+    this.trailingStopLevel =
+      direction === 'long'
+        ? entryPrice - offPts
+        : entryPrice + offPts;
+        this.noTrailBeforeMs = Date.now();
 
-    this.noTrailBeforeMs = Date.now();
-
-    console.info('[MNQDeltaTrend][ENTRY:init:PURE-TRAIL]', {
-      dir: direction, entry: entryPrice, offPts, actPts, trailingStopLevel: this.trailingStopLevel
+    console.info('[MNQDeltaTrend][ENTRY:trail-frozen]', {
+      dir: direction,
+      entry: entryPrice,
+      entryATR: atrAtEntry,
+      offMult, actMult,
+      offPts, actPts,
+      armed: this.trailArmed,
+      trailingStopLevel: this.trailingStopLevel
     });
   }
 
@@ -613,6 +641,7 @@ export class MNQDeltaTrendCalculator {
       if (this.config.useEmaFilter && !passLong) {
         return { signal: 'hold', reason: 'LTF EMA long filter (forming)', confidence: 0 };
       }
+      this.lastAtrAtSignal = atr;                           // <-- ADD THIS LINE
       return { 
         signal: 'buy', 
         reason: `[INTRA-BAR] Δ=${delta.toFixed(0)} > ${spike} & > ${longThreshold.toFixed(0)} (${this.intraBarDeltaHistory.length} confirms), bullish HTF, breakout`, 
@@ -625,6 +654,7 @@ export class MNQDeltaTrendCalculator {
       if (this.config.useEmaFilter && !passShort) {
         return { signal: 'hold', reason: 'LTF EMA short filter (forming)', confidence: 0 };
       }
+      this.lastAtrAtSignal = atr;                           // <-- ADD THIS LINE
       return { 
         signal: 'sell', 
         reason: `[INTRA-BAR] Δ=${delta.toFixed(0)} < ${-spike} & < ${shortThreshold.toFixed(0)} (${this.intraBarDeltaHistory.length} confirms), bearish HTF, breakdown`, 
@@ -646,6 +676,8 @@ export class MNQDeltaTrendCalculator {
     this.currentPosition = null;
     this.trailingStopLevel = 0;
     this.trailArmed = false;
+    this.fixedTrail = null;
+    this.lastAtrAtSignal = null;      // <-- ADD THIS LINE
   }
 
   public hasPosition(): boolean {
@@ -658,26 +690,26 @@ export class MNQDeltaTrendCalculator {
 
   public onTickForProtectiveStops(lastPrice: number, _atrNow: number): 'none' | 'hitStop' | 'hitTrail' {
     if (!this.currentPosition || !Number.isFinite(lastPrice)) return 'none';
+    if (!this.fixedTrail) return 'none'; // no trail distances → nothing to do
+
     const { direction: dir, entryPrice } = this.currentPosition;
+    const { offPts, actPts } = this.fixedTrail;
 
-    // Interpret config values as fixed *points*, not ATR-multipliers
-    const offPts = Number(this.config.trailOffsetATR ?? 1.25);         // gap in points
-    const actPts = Math.max(0, Number(this.config.trailActivationATR ?? 0)); // activation distance in points
-
-    // Arm if not yet armed and move has reached activation distance
-    if (!this.trailArmed) {
-      if ((dir === 'long'  && (lastPrice - entryPrice) >= actPts) ||
-          (dir === 'short' && (entryPrice - lastPrice) >= actPts)) {
-        this.trailArmed = true;
-        // First arm: set trail directly from price
-        this.trailingStopLevel = (dir === 'long') ? (lastPrice - offPts) : (lastPrice + offPts);
-        this.currentPosition.stopLoss = this.trailingStopLevel; // keep logs aligned
-      } else {
-        return 'none';
+    // Wait until activation distance reached before trail can move
+    const reachedActivation =
+      (dir === 'long'  && (lastPrice - entryPrice) >= actPts) ||
+      (dir === 'short' && (entryPrice - lastPrice) >= actPts);
+    if (!reachedActivation) {
+      // Trail is live but frozen until activation hit
+      this.currentPosition.stopLoss = this.trailingStopLevel;
+      if ((dir === 'long' && lastPrice <= this.trailingStopLevel) ||
+          (dir === 'short' && lastPrice >= this.trailingStopLevel)) {
+        return 'hitTrail';
       }
+      return 'none';
     }
 
-    // Update trail while armed
+    // Update trail while armed (ratchet only; never widen)
     if (dir === 'long') {
       const candidate = lastPrice - offPts;
       if (candidate > this.trailingStopLevel) this.trailingStopLevel = candidate;
@@ -689,6 +721,7 @@ export class MNQDeltaTrendCalculator {
       this.currentPosition.stopLoss = this.trailingStopLevel;
       if (lastPrice >= this.trailingStopLevel) return 'hitTrail';
     }
+
     return 'none';
   }
 

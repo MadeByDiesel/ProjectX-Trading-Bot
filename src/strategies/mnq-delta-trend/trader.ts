@@ -183,7 +183,7 @@ export class MNQDeltaTrendTrader {
     this.lastCumVolByContract.set(contractId, cumVol);
 
     // Tick-level protective exits (stop/trail)
-    if (this.calculator.hasPosition() && !this.isFlattening) {
+    if (this.calculator.hasPosition() && !this.isFlattening && !this.isEnteringPosition) { // <<< added guard
       const hit = this.calculator.onTickForProtectiveStops(px, this.marketState.atr ?? 0);
       if (hit === 'hitStop' || hit === 'hitTrail') {
         const dir = this.calculator.getPositionDirection();
@@ -379,16 +379,20 @@ export class MNQDeltaTrendTrader {
 
     this.isEnteringPosition = true;
 
+    // Pre-mark the bar to block bar-close path; rollback on failure
+    const barGate = this.barStartMs;
+    this.enteredBarStartMs = barGate;
+
     try {
       const direction = signal.signal === 'buy' ? 'long' : 'short';
       const atr = this.marketState.atr ?? 0;
-      
+
       const acctBal = await this.client.getEquity();
       const qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));
 
       console.info(
         `[MNQDeltaTrend][INTRA-BAR ORDER] ${signal.signal.toUpperCase()} qty=${qty}`,
-        `confidence=${signal.confidence} bar=${new Date(this.barStartMs!).toISOString()}`
+        `confidence=${signal.confidence} bar=${new Date(barGate!).toISOString()}`
       );
 
       await this.client.createOrder({
@@ -397,9 +401,6 @@ export class MNQDeltaTrendTrader {
         side: signal.signal === 'buy' ? 0 : 1,
         size: qty,
       });
-
-      // Mark this bar as entered
-      this.enteredBarStartMs = this.barStartMs;
 
       try {
         (this.calculator as any).setPosition?.(bar.close, direction, atr);
@@ -413,8 +414,8 @@ export class MNQDeltaTrendTrader {
 
     } catch (err) {
       console.error('[MNQDeltaTrend][INTRA-BAR ORDER] execution failed:', err);
-      // If order failed, allow retry on this bar
-      this.enteredBarStartMs = null;
+      // Rollback gate so bar-close can retry
+      if (this.enteredBarStartMs === barGate) this.enteredBarStartMs = null;
     } finally {
       this.isEnteringPosition = false;
     }
@@ -470,6 +471,12 @@ export class MNQDeltaTrendTrader {
       return;
     }
 
+    // Hard block if entry or flatten in-flight
+    if (this.isEnteringPosition || this.isFlattening) {   // <<< added
+      console.debug('[MNQDeltaTrend][order] blocked: op in-flight');
+      return;
+    }
+
     // Don't add to position
     if (this.calculator.hasPosition()) {
       if (signal.signal === 'buy' || signal.signal === 'sell') {
@@ -501,6 +508,10 @@ export class MNQDeltaTrendTrader {
 
     console.info(`[MNQDeltaTrend][order] ${signal.signal.toUpperCase()} qty=${qty} reason="${signal.reason}"`);
 
+    // Pre-mark the bar to block intra-bar overlap; rollback on failure
+    const barGate = this.barStartMs;
+    this.enteredBarStartMs = barGate;
+
     try {
       await this.client.createOrder({
         contractId: this.contractId,
@@ -508,9 +519,6 @@ export class MNQDeltaTrendTrader {
         side: signal.signal === 'buy' ? 0 : 1,
         size: qty,
       });
-
-      // Mark bar as entered
-      this.enteredBarStartMs = this.barStartMs;
 
       try {
         (this.calculator as any).setPosition?.(bar.close, direction, atr);
@@ -522,6 +530,8 @@ export class MNQDeltaTrendTrader {
 
     } catch (err) {
       console.error('[MNQDeltaTrend][order] placement failed:', err);
+      // Rollback gate so intra-bar path can retry
+      if (this.enteredBarStartMs === barGate) this.enteredBarStartMs = null;
     }
   }
 }

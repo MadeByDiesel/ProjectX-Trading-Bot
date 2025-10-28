@@ -4,6 +4,14 @@ import { TechnicalCalculator } from '../../utils/technical';
 
 console.log('[calc] loaded', __filename);
 
+// --- Tick precision helpers (MNQ = 0.25) ---
+const TICK_SIZE = 0.25;
+const snapToTick = (p: number): number => Math.round(p / TICK_SIZE) * TICK_SIZE;
+const snapStop = (p: number, dir: 'long' | 'short'): number =>
+  dir === 'long'
+    ? Math.floor(p / TICK_SIZE) * TICK_SIZE
+    : Math.ceil(p / TICK_SIZE) * TICK_SIZE;
+
 export class MNQDeltaTrendCalculator {
   private config: StrategyConfig;
   private technical: TechnicalCalculator;
@@ -35,12 +43,15 @@ export class MNQDeltaTrendCalculator {
   private lastHTFBucketStartMs: number | null = null;
 
   // Intra-bar signal tracking
-  private lastIntraBarSignalTime = 0;
   private intraBarDeltaHistory: Array<{ delta: number; timestamp: number }> = [];
   private lastEntryBarTimestamp: string | null = null;
 
   constructor(config: StrategyConfig) {
     this.config = config;
+    // Ensure HTF parity with Pine: include forming bar intrabar
+    if (typeof (this as any).config.htfUseForming !== 'boolean') {
+      (this as any).config.htfUseForming = true;
+    }
     this.technical = new TechnicalCalculator();
     console.info('[MNQDeltaTrend][Config:Calculator]', this.config);
   }
@@ -220,6 +231,41 @@ export class MNQDeltaTrendCalculator {
     };
   }
 
+  /**
+   * LTF EMA filter using the **forming** close (Pine-like intrabar update).
+   */
+  private checkLtfEmaFilterWithForming(formingClose: number): { passLong: boolean; passShort: boolean; lastClose: number; lastEma: number } {
+    if (!this.config.useEmaFilter) {
+      return { passLong: true, passShort: true, lastClose: formingClose, lastEma: NaN };
+    }
+
+    const L = Math.max(1, this.config.emaLength ?? 21);
+    const closes = this.bars3min.map(b => b.close);
+
+    if (closes.length === 0) {
+      return { passLong: false, passShort: false, lastClose: NaN, lastEma: NaN };
+    }
+
+    // Compute EMA as-if the forming close is the current close
+    const seed = this.technical.calculateEMA(closes, Math.min(L, closes.length));
+    const lastEmaClosed = seed[seed.length - 1];
+
+    if (!Number.isFinite(lastEmaClosed)) {
+      return { passLong: false, passShort: false, lastClose: NaN, lastEma: NaN };
+    }
+
+    // One-step EMA update with forming close (EMA_k = α*C_k + (1-α)*EMA_{k-1})
+    const alpha = 2 / (L + 1);
+    const emaWithForming = alpha * formingClose + (1 - alpha) * lastEmaClosed;
+
+    return {
+      passLong: formingClose > emaWithForming,
+      passShort: formingClose < emaWithForming,
+      lastClose: formingClose,
+      lastEma: emaWithForming
+    };
+  }
+
   private determineTrend(): 'bullish' | 'bearish' | 'neutral' {
     if (this.bars15min.length < 2) return 'neutral';
     const L = Math.max(1, this.config.htfEMALength ?? 50);
@@ -234,6 +280,20 @@ export class MNQDeltaTrendCalculator {
     const px = closes[closes.length - 1];
     const ema = emaSeries[emaSeries.length - 1];
     return px > ema ? 'bullish' : px < ema ? 'bearish' : 'neutral';
+  }
+
+  private checkBreakoutIntrabar(formingBar: BarData) {
+    const n = Math.max(1, this.config.breakoutLookbackBars ?? 20);
+    if (this.bars3min.length < n) {
+      return { brokeUp: false, brokeDown: false };
+    }
+    const window = this.bars3min.slice(-n);
+    const rangeHigh = Math.max(...window.map(b => b.high));
+    const rangeLow  = Math.min(...window.map(b => b.low));
+    return {
+      brokeUp:   formingBar.high > rangeHigh,
+      brokeDown: formingBar.low  < rangeLow,
+    };
   }
 
   private checkBreakoutCloseTol() {
@@ -251,6 +311,32 @@ export class MNQDeltaTrendCalculator {
     return {
       brokeUpCloseTol:   last.close > rangeHigh * 0.995,
       brokeDownCloseTol: last.close < rangeLow  * 1.005,
+    };
+  }
+
+  /**
+   * Intrabar breakout using the forming bar:
+   * window = last (n-1) closed bars + forming bar's evolving high/low.
+   */
+  private checkBreakoutWithForming(forming: BarData) {
+    const n = Math.max(1, this.config.breakoutLookbackBars ?? 20);
+    if (this.bars3min.length < n - 1) {
+      return { brokeUpCloseTol: false, brokeDownCloseTol: false };
+    }
+
+    // last (n-1) closed bars
+    const closedWindow = this.bars3min.slice(-Math.max(0, n - 1));
+    const closedHigh = closedWindow.length ? Math.max(...closedWindow.map(b => b.high)) : -Infinity;
+    const closedLow  = closedWindow.length ? Math.min(...closedWindow.map(b => b.low))  :  Infinity;
+
+    // include forming high/low
+    const rangeHigh = Math.max(closedHigh, forming.high);
+    const rangeLow  = Math.min(closedLow,  forming.low);
+
+    // keep same close-tolerance logic used on Oct-16 baseline
+    return {
+      brokeUpCloseTol:   forming.close > rangeHigh * 0.995,
+      brokeDownCloseTol: forming.close < rangeLow  * 1.005,
     };
   }
 
@@ -437,21 +523,27 @@ export class MNQDeltaTrendCalculator {
 
     this.fixedTrail = { offPts, actPts, entryATR: atrAtEntry };
 
-    // Initialize position; initial SL for logs (live trail may arm later)
+    // Initialize position
     this.currentPosition = {
       entryPrice,
       entryTime: Date.now(),
       direction,
-      stopLoss: direction === 'long' ? entryPrice - offPts : entryPrice + offPts,
+      stopLoss: 0, // set below after snapping
     };
 
     // Always arm immediately (Pine-style); trail exists from tick 1
     this.trailArmed = true;
-    this.trailingStopLevel =
+
+    const rawStop =
       direction === 'long'
         ? entryPrice - offPts
         : entryPrice + offPts;
-        this.noTrailBeforeMs = Date.now();
+
+    // snap initial trail to tick grid
+    this.trailingStopLevel = snapStop(rawStop, direction);
+    this.currentPosition.stopLoss = this.trailingStopLevel;
+
+    this.noTrailBeforeMs = Date.now();
 
     console.info('[MNQDeltaTrend][ENTRY:trail-frozen]', {
       dir: direction,
@@ -535,21 +627,12 @@ export class MNQDeltaTrendCalculator {
       };
     }
 
-    // Safeguard 3: Signal cooldown
-    const cooldownMs = 2000;
-    if ((nowMs - this.lastIntraBarSignalTime) < cooldownMs) {
-      return { 
-        signal: 'hold', 
-        reason: 'Signal cooldown active', 
-        confidence: 0 
-      };
-    }
 
-    // Use closed bars for all indicators
+    // Use closed bars for ATR/HTF; breakout & LTF EMA use the forming snapshot
     const atr = this.calculateATR();
     const trend = this.determineTrend();
-    const { brokeUpCloseTol, brokeDownCloseTol } = this.checkBreakoutCloseTol();
-    const { passLong, passShort } = this.checkLtfEmaFilter();
+    const { brokeUp, brokeDown } = this.checkBreakoutIntrabar(formingBar);
+    const { passLong, passShort } = this.checkLtfEmaFilterWithForming(formingBar.close);
 
     marketState.atr = Number.isFinite(atr) ? atr : 0;
     marketState.higherTimeframeTrend = trend;
@@ -557,14 +640,10 @@ export class MNQDeltaTrendCalculator {
     const signal = this.generateSignalForFormingBar(
       formingBar, 
       marketState, 
-      { brokeUpCloseTol, brokeDownCloseTol, passLong, passShort }
+      { brokeUp, brokeDown, passLong, passShort } 
     );
 
-    if (signal.signal === 'buy' || signal.signal === 'sell') {
-      this.lastIntraBarSignalTime = nowMs;
-    }
-
-    return signal;
+  return signal;
   }
 
   /**
@@ -573,9 +652,9 @@ export class MNQDeltaTrendCalculator {
   private generateSignalForFormingBar(
     formingBar: BarData,
     marketState: MarketState,
-    gates: { brokeUpCloseTol: boolean; brokeDownCloseTol: boolean; passLong: boolean; passShort: boolean }
+    gates: { brokeUp: boolean; brokeDown: boolean; passLong: boolean; passShort: boolean }
   ): TradeSignal {
-    const { brokeUpCloseTol, brokeDownCloseTol, passLong, passShort } = gates;
+    const { brokeUp, brokeDown, passLong, passShort } = gates;
 
     // ATR gate
     const atr = marketState.atr;
@@ -637,7 +716,7 @@ export class MNQDeltaTrendCalculator {
     const htf = marketState.higherTimeframeTrend;
 
     // Long entry
-    if (passDeltaLong && htf === 'bullish' && brokeUpCloseTol) {
+    if (passDeltaLong && htf === 'bullish' && brokeUp) {
       if (this.config.useEmaFilter && !passLong) {
         return { signal: 'hold', reason: 'LTF EMA long filter (forming)', confidence: 0 };
       }
@@ -650,7 +729,7 @@ export class MNQDeltaTrendCalculator {
     }
 
     // Short entry
-    if (passDeltaShort && htf === 'bearish' && brokeDownCloseTol) {
+    if (passDeltaShort && htf === 'bearish' && brokeDown) {
       if (this.config.useEmaFilter && !passShort) {
         return { signal: 'hold', reason: 'LTF EMA short filter (forming)', confidence: 0 };
       }
@@ -690,8 +769,17 @@ export class MNQDeltaTrendCalculator {
 
   public onTickForProtectiveStops(lastPrice: number, _atrNow: number): 'none' | 'hitStop' | 'hitTrail' {
     if (!this.currentPosition || !Number.isFinite(lastPrice)) return 'none';
-    if (!this.fixedTrail) return 'none'; // no trail distances → nothing to do
+    if (!this.fixedTrail) return 'none';
 
+      // Pine parity — defer trail until canExit (minBarsBeforeExit)
+    const minBars = Math.max(0, this.config.minBarsBeforeExit ?? 0);
+    if (minBars > 0) {
+      const { entryTime } = this.currentPosition;
+      const barsSinceEntry = this.bars3min.filter(b => new Date(b.timestamp).getTime() > entryTime).length;
+      if (barsSinceEntry < minBars) return 'none';
+    }
+
+    const px = snapToTick(lastPrice);                 // <<< use snapToTick
     const { direction: dir, entryPrice } = this.currentPosition;
     const { offPts, actPts } = this.fixedTrail;
 
@@ -700,28 +788,30 @@ export class MNQDeltaTrendCalculator {
       (dir === 'long'  && (lastPrice - entryPrice) >= actPts) ||
       (dir === 'short' && (entryPrice - lastPrice) >= actPts);
     if (!reachedActivation) {
-      // Trail is live but frozen until activation hit
+      // ensure stored stop is snapped
+      this.trailingStopLevel = snapStop(this.trailingStopLevel, dir);
       this.currentPosition.stopLoss = this.trailingStopLevel;
-      if ((dir === 'long' && lastPrice <= this.trailingStopLevel) ||
-          (dir === 'short' && lastPrice >= this.trailingStopLevel)) {
+
+      if ((dir === 'long' && px <= this.trailingStopLevel) ||
+          (dir === 'short' && px >= this.trailingStopLevel)) {
         return 'hitTrail';
       }
       return 'none';
     }
 
-    // Update trail while armed (ratchet only; never widen)
     if (dir === 'long') {
-      const candidate = lastPrice - offPts;
+      const candidateRaw = px - offPts;
+      const candidate = snapStop(candidateRaw, dir);           // <<< snap candidate
       if (candidate > this.trailingStopLevel) this.trailingStopLevel = candidate;
       this.currentPosition.stopLoss = this.trailingStopLevel;
-      if (lastPrice <= this.trailingStopLevel) return 'hitTrail';
+      if (px <= this.trailingStopLevel) return 'hitTrail';     // <<< compare snapped px
     } else {
-      const candidate = lastPrice + offPts;
+      const candidateRaw = px + offPts;
+      const candidate = snapStop(candidateRaw, dir);           // <<< snap candidate
       if (candidate < this.trailingStopLevel) this.trailingStopLevel = candidate;
       this.currentPosition.stopLoss = this.trailingStopLevel;
-      if (lastPrice >= this.trailingStopLevel) return 'hitTrail';
+      if (px >= this.trailingStopLevel) return 'hitTrail';     // <<< compare snapped px
     }
-
     return 'none';
   }
 

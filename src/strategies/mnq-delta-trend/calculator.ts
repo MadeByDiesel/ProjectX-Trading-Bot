@@ -579,7 +579,9 @@ export class MNQDeltaTrendCalculator {
     );
 
     // Use closed bars for ATR/HTF; breakout & LTF EMA use the forming snapshot
+    this.bars3min.push(formingBar);
     const atr = this.calculateATR();
+    this.bars3min.pop();
     const trend = this.determineTrend();
     const { brokeUp, brokeDown } = this.checkBreakoutIntrabar(formingBar);
     const { passLong, passShort } = this.checkLtfEmaFilterWithForming(formingBar.close);

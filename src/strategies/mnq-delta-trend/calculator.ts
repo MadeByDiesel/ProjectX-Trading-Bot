@@ -201,6 +201,14 @@ export class MNQDeltaTrendCalculator {
     return atr;
   }
 
+  // PUBLIC: compute ATR including the current forming bar snapshot (Pine-accurate gate)
+  public atrWithForming(formingBar: BarData): number {
+    this.bars3min.push(formingBar);
+    const atr = this.calculateATR();
+    this.bars3min.pop();
+    return atr;
+  }
+
   private checkLtfEmaFilter(): { passLong: boolean; passShort: boolean; lastClose: number; lastEma: number } {
     if (!this.config.useEmaFilter) {
       const lastClose = this.bars3min.length ? this.bars3min[this.bars3min.length - 1].close : NaN;

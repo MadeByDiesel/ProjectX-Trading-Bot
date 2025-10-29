@@ -387,7 +387,21 @@ export class MNQDeltaTrendTrader {
 
     try {
       const direction = signal.signal === 'buy' ? 'long' : 'short';
-      const atr = this.marketState.atr ?? 0;
+
+      // --- Pine-accurate ATR gate using forming bar ---
+      let atr = this.marketState.atr ?? 0;
+      try {
+         atr = this.calculator.atrWithForming(bar);
+      } catch { /* fallback to last ATR */ }
+
+      // Apply gate locally (do not modify global marketState)
+      const minAtr = Math.max(0, this.config.minAtrToTrade ?? 0);
+      if (!Number.isFinite(atr) || atr < minAtr) {
+        console.debug(`[MNQDeltaTrend][INTRA-BAR ORDER] blocked: forming ATR gate failed (atr=${atr}, thresh=${minAtr})`);
+        this.isEnteringPosition = false;
+        this.enteredBarStartMs = null;
+        return;
+      }
 
       const acctBal = await this.client.getEquity();
       const qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));

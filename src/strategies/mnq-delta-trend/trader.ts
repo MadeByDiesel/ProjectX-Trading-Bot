@@ -317,9 +317,6 @@ export class MNQDeltaTrendTrader {
       return; // Already entered on this bar
     }
 
-    // Calculate how long this bar has been forming
-    const accumulationTimeMs = nowMs - this.liveBarStartMs;
-
     // Get current accumulated delta
     const currentDelta = this.signedVolInBarByContract.get(this.contractId) ?? 0;
     const currentVolume = this.volInBarByContract.get(this.contractId) ?? 0;
@@ -335,11 +332,10 @@ export class MNQDeltaTrendTrader {
       delta: currentDelta,
     };
 
-    // Ask calculator to evaluate with safeguards
+    // AFTER
     const signal = this.calculator.evaluateFormingBar(
       formingBar,
-      this.marketState as any,
-      accumulationTimeMs
+      this.marketState as any
     );
 
     // Only act on buy/sell signals
@@ -347,9 +343,9 @@ export class MNQDeltaTrendTrader {
       console.info(
         `[MNQDeltaTrend][INTRA-BAR SIGNAL] ${signal.signal.toUpperCase()}`,
         `Δ=${currentDelta.toFixed(0)} px=${currentPrice.toFixed(2)}`,
-        `accumulated=${accumulationTimeMs}ms reason="${signal.reason}"`
+        `reason="${signal.reason}"`
       );
-      
+            
       void this.executeIntraBarSignal(signal, formingBar);
     }
   }

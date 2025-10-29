@@ -36,8 +36,6 @@ export class MNQDeltaTrendCalculator {
   private lastAtrAtSignal: number | null = null;
 
   private trailingStopLevel = 0;
-  private trailArmed = false;
-  private noTrailBeforeMs = 0;
 
   // Track HTF bucket to avoid duplicate/new-bar mistakes
   private lastHTFBucketStartMs: number | null = null;
@@ -48,10 +46,6 @@ export class MNQDeltaTrendCalculator {
 
   constructor(config: StrategyConfig) {
     this.config = config;
-    // Ensure HTF parity with Pine: include forming bar intrabar
-    if (typeof (this as any).config.htfUseForming !== 'boolean') {
-      (this as any).config.htfUseForming = true;
-    }
     this.technical = new TechnicalCalculator();
     console.info('[MNQDeltaTrend][Config:Calculator]', this.config);
   }
@@ -314,32 +308,6 @@ export class MNQDeltaTrendCalculator {
     };
   }
 
-  /**
-   * Intrabar breakout using the forming bar:
-   * window = last (n-1) closed bars + forming bar's evolving high/low.
-   */
-  private checkBreakoutWithForming(forming: BarData) {
-    const n = Math.max(1, this.config.breakoutLookbackBars ?? 20);
-    if (this.bars3min.length < n - 1) {
-      return { brokeUpCloseTol: false, brokeDownCloseTol: false };
-    }
-
-    // last (n-1) closed bars
-    const closedWindow = this.bars3min.slice(-Math.max(0, n - 1));
-    const closedHigh = closedWindow.length ? Math.max(...closedWindow.map(b => b.high)) : -Infinity;
-    const closedLow  = closedWindow.length ? Math.min(...closedWindow.map(b => b.low))  :  Infinity;
-
-    // include forming high/low
-    const rangeHigh = Math.max(closedHigh, forming.high);
-    const rangeLow  = Math.min(closedLow,  forming.low);
-
-    // keep same close-tolerance logic used on Oct-16 baseline
-    return {
-      brokeUpCloseTol:   forming.close > rangeHigh * 0.995,
-      brokeDownCloseTol: forming.close < rangeLow  * 1.005,
-    };
-  }
-
   private checkExitConditions(bar: BarData, _marketState: MarketState): TradeSignal | null {
     if (!this.currentPosition) return null;
 
@@ -350,6 +318,15 @@ export class MNQDeltaTrendCalculator {
 
     const trail = this.trailingStopLevel;
     if (!Number.isFinite(trail)) return null;
+
+    const stop = this.currentPosition.stopLoss;
+
+    if (direction === 'long' && bar.low <= stop) {
+      return { signal: 'sell', reason: `Hit stop (${stop.toFixed(2)})`, confidence: 1.0 };
+    }
+    if (direction === 'short' && bar.high >= stop) {
+      return { signal: 'buy', reason: `Hit stop (${stop.toFixed(2)})`, confidence: 1.0 };
+    }
 
     if (direction === 'long'  && bar.low  <= trail) {
       return { signal: 'sell', reason: `Hit trail (${trail.toFixed(2)})`, confidence: 1.0 };
@@ -421,7 +398,6 @@ export class MNQDeltaTrendCalculator {
 
     const spike = this.config.deltaSpikeThreshold ?? 750;
     const delta = bar.delta ?? 0;
-    const absDelta = Math.abs(delta);
 
     const len = Math.max(1, this.config.deltaSMALength ?? 20);
     const deltaSMA = this.smaSignedDelta(len, this.bars3min.length - 1);
@@ -441,6 +417,8 @@ export class MNQDeltaTrendCalculator {
       delta < -spike && 
       delta < (deltaSMA * -surgeMult)  // FIXED: negative threshold
     );
+
+    const absDelta = Math.abs(delta);
 
     console.debug('[MNQDeltaTrend][deltaCheck]', {
       delta,
@@ -531,9 +509,6 @@ export class MNQDeltaTrendCalculator {
       stopLoss: 0, // set below after snapping
     };
 
-    // Always arm immediately (Pine-style); trail exists from tick 1
-    this.trailArmed = true;
-
     const rawStop =
       direction === 'long'
         ? entryPrice - offPts
@@ -543,15 +518,12 @@ export class MNQDeltaTrendCalculator {
     this.trailingStopLevel = snapStop(rawStop, direction);
     this.currentPosition.stopLoss = this.trailingStopLevel;
 
-    this.noTrailBeforeMs = Date.now();
-
     console.info('[MNQDeltaTrend][ENTRY:trail-frozen]', {
       dir: direction,
       entry: entryPrice,
       entryATR: atrAtEntry,
       offMult, actMult,
       offPts, actPts,
-      armed: this.trailArmed,
       trailingStopLevel: this.trailingStopLevel
     });
   }
@@ -562,7 +534,6 @@ export class MNQDeltaTrendCalculator {
   public evaluateFormingBar(
     formingBar: BarData,
     marketState: MarketState,
-    accumulationTimeMs: number
   ): TradeSignal {
     if (!this.isWarmUpProcessed) {
       return { signal: 'hold', reason: 'Warm-up incomplete', confidence: 0 };
@@ -597,17 +568,6 @@ export class MNQDeltaTrendCalculator {
       console.warn('[MNQDeltaTrend][FormingBar] session check failed:', err);
     }
 
-    // Safeguard 1: Minimum accumulation time
-    const minAccumMs = this.config.intraBarMinAccumulationMs ?? 5000;
-    if (accumulationTimeMs < minAccumMs) {
-      return { 
-        signal: 'hold', 
-        reason: `Accumulation time ${accumulationTimeMs}ms < min ${minAccumMs}ms`, 
-        confidence: 0 
-      };
-    }
-
-    // Safeguard 2: Confirmation window
     const nowMs = Date.now();
     const delta = formingBar.delta ?? 0;
     
@@ -617,16 +577,6 @@ export class MNQDeltaTrendCalculator {
     this.intraBarDeltaHistory = this.intraBarDeltaHistory.filter(
       entry => (nowMs - entry.timestamp) <= confirmWindowMs
     );
-    
-    const requiredConfirmations = this.config.intraBarConfirmationChecks ?? 3;
-    if (this.intraBarDeltaHistory.length < requiredConfirmations) {
-      return { 
-        signal: 'hold', 
-        reason: `Need ${requiredConfirmations} confirmations, have ${this.intraBarDeltaHistory.length}`, 
-        confidence: 0 
-      };
-    }
-
 
     // Use closed bars for ATR/HTF; breakout & LTF EMA use the forming snapshot
     const atr = this.calculateATR();
@@ -670,7 +620,6 @@ export class MNQDeltaTrendCalculator {
 
     const spike = this.config.deltaSpikeThreshold ?? 750;
     const delta = formingBar.delta ?? 0;
-    const absDelta = Math.abs(delta);
 
     // Use last CLOSED bar's SMA
     const len = Math.max(1, this.config.deltaSMALength ?? 20);
@@ -699,7 +648,6 @@ export class MNQDeltaTrendCalculator {
 
     console.debug('[MNQDeltaTrend][formingBarCheck]', {
       delta,
-      absDelta,
       spike,
       deltaSMA,
       surgeMult,
@@ -715,28 +663,32 @@ export class MNQDeltaTrendCalculator {
 
     const htf = marketState.higherTimeframeTrend;
 
-    // Long entry
+    // Long entry — FORMING BAR
     if (passDeltaLong && htf === 'bullish' && brokeUp) {
       if (this.config.useEmaFilter && !passLong) {
         return { signal: 'hold', reason: 'LTF EMA long filter (forming)', confidence: 0 };
       }
-      this.lastAtrAtSignal = atr;                           // <-- ADD THIS LINE
-      return { 
-        signal: 'buy', 
-        reason: `[INTRA-BAR] Δ=${delta.toFixed(0)} > ${spike} & > ${longThreshold.toFixed(0)} (${this.intraBarDeltaHistory.length} confirms), bullish HTF, breakout`, 
+      this.lastEntryBarTimestamp = formingBar.timestamp;
+      this.lastAtrAtSignal = atr;
+
+      return {
+        signal: 'buy',
+        reason: `[INTRA-BAR] Δ=${delta.toFixed(0)} > ${spike} & > ${longThreshold.toFixed(0)} (${this.intraBarDeltaHistory.length} confirms), bullish HTF, breakout`,
         confidence: 0.85
       };
     }
 
-    // Short entry
+    // Short entry — FORMING BAR  (FIX: mirrors long branch; correct breakout gate; stamps timestamp+ATR)
     if (passDeltaShort && htf === 'bearish' && brokeDown) {
       if (this.config.useEmaFilter && !passShort) {
         return { signal: 'hold', reason: 'LTF EMA short filter (forming)', confidence: 0 };
       }
-      this.lastAtrAtSignal = atr;                           // <-- ADD THIS LINE
-      return { 
-        signal: 'sell', 
-        reason: `[INTRA-BAR] Δ=${delta.toFixed(0)} < ${-spike} & < ${shortThreshold.toFixed(0)} (${this.intraBarDeltaHistory.length} confirms), bearish HTF, breakdown`, 
+      this.lastEntryBarTimestamp = formingBar.timestamp;
+      this.lastAtrAtSignal = atr;
+
+      return {
+        signal: 'sell',
+        reason: `[INTRA-BAR] Δ=${delta.toFixed(0)} < ${-spike} & < ${shortThreshold.toFixed(0)} (${this.intraBarDeltaHistory.length} confirms), bearish HTF, breakdown`,
         confidence: 0.85
       };
     }
@@ -754,7 +706,6 @@ export class MNQDeltaTrendCalculator {
   public clearPosition(): void {
     this.currentPosition = null;
     this.trailingStopLevel = 0;
-    this.trailArmed = false;
     this.fixedTrail = null;
     this.lastAtrAtSignal = null;      // <-- ADD THIS LINE
   }
@@ -783,10 +734,11 @@ export class MNQDeltaTrendCalculator {
     const { direction: dir, entryPrice } = this.currentPosition;
     const { offPts, actPts } = this.fixedTrail;
 
-    // Wait until activation distance reached before trail can move
+    // Use snapped price for activation check
     const reachedActivation =
-      (dir === 'long'  && (lastPrice - entryPrice) >= actPts) ||
-      (dir === 'short' && (entryPrice - lastPrice) >= actPts);
+      (dir === 'long'  && (px - entryPrice) >= actPts) ||
+      (dir === 'short' && (entryPrice - px) >= actPts);
+
     if (!reachedActivation) {
       // ensure stored stop is snapped
       this.trailingStopLevel = snapStop(this.trailingStopLevel, dir);

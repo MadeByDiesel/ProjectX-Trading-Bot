@@ -316,6 +316,12 @@ export class MNQDeltaTrendTrader {
     if (this.enteredBarStartMs === this.barStartMs) {
       return; // Already entered on this bar
     }
+    
+    // Reset delta accumulation when a new bar starts forming (Pine-accurate intrabar behavior)
+    if (this.lastIntraBarCheckMs === 0) {
+      this.signedVolInBarByContract.set(this.contractId, 0);
+      this.volInBarByContract.set(this.contractId, 0);
+    }
 
     // Get current accumulated delta
     const currentDelta = this.signedVolInBarByContract.get(this.contractId) ?? 0;

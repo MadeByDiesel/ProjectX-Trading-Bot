@@ -43,6 +43,8 @@ export class MNQDeltaTrendCalculator {
   // Intra-bar signal tracking
   private intraBarDeltaHistory: Array<{ delta: number; timestamp: number }> = [];
   private lastEntryBarTimestamp: string | null = null;
+  private lastIntraBarSignalTime = 0;    // cooldown stamping
+  private firstDeltaMsInBar = 0;         // accumulation start for current bar  
 
   constructor(config: StrategyConfig) {
     this.config = config;
@@ -496,16 +498,27 @@ export class MNQDeltaTrendCalculator {
       return;
     }
 
-    // --- STOP/T R A I L  MULTIPLIERS (locked to ATR at entry) ---
-    const slMult = Number(this.config.atrStopLossMultiplier ?? 0.20);  // TRUE initial hard stop (not the trail)
-    const offMult = Number(this.config.trailOffsetATR ?? 0.125);       // trail offset distance
-    const actMult = Math.max(0, Number(this.config.trailActivationATR ?? 0.30)); // activation move
+    // --- ATR cap at entry + compressed SL multiplier if ATR > cap ---
+    const ATR_CAP = (this as any).config?.atrCap ?? 24;               // points
+    const baseSlMult = Number(this.config.atrStopLossMultiplier ?? 0.20);
+    const offMult    = Number(this.config.trailOffsetATR ?? 0.125);
+    const actMult    = Math.max(0, Number(this.config.trailActivationATR ?? 0.30));
 
-    const slPts  = atrAtEntry * slMult;   // initial hard stop width
-    const offPts = atrAtEntry * offMult;  // trail offset width
-    const actPts = atrAtEntry * actMult;  // trail activation move
+    // Cap the seed used for all entry-locked math
+    const atrSeed = Math.min(atrAtEntry, ATR_CAP);
 
-    this.fixedTrail = { offPts, actPts, entryATR: atrAtEntry };
+    // If raw ATR > cap, compress SL multiplier proportionally so SL distance never exceeds cap*baseMult
+    const slMult = (atrAtEntry > ATR_CAP)
+      ? baseSlMult * (ATR_CAP / atrAtEntry)
+      : baseSlMult;
+
+    // Distances (from capped seed and possibly compressed SL multiplier)
+    const slPts  = atrSeed * slMult;
+    const offPts = atrSeed * offMult;
+    const actPts = atrSeed * actMult;
+
+    // Store only the entry ATR seed; off/act will be re-derived (with optional compression) on each tick
+    this.fixedTrail = { offPts, actPts, entryATR: atrSeed };
 
     // Initialize position
     this.currentPosition = {
@@ -575,11 +588,22 @@ export class MNQDeltaTrendCalculator {
     const delta = formingBar.delta ?? 0;
     
     this.intraBarDeltaHistory.push({ delta, timestamp: nowMs });
+    if (this.firstDeltaMsInBar === 0) this.firstDeltaMsInBar = nowMs;
     
     const confirmWindowMs = this.config.intraBarConfirmationWindowMs ?? 500;
     this.intraBarDeltaHistory = this.intraBarDeltaHistory.filter(
       entry => (nowMs - entry.timestamp) <= confirmWindowMs
     );
+
+    const minAccumMs = this.config.intraBarMinAccumulationMs ?? 5000;
+    if ((nowMs - this.firstDeltaMsInBar) < minAccumMs) {
+      return { signal: 'hold', reason: `Accumulation < ${minAccumMs}ms`, confidence: 0 };
+    }
+
+    const requiredConfirmations = this.config.intraBarConfirmationChecks ?? 3;
+    if (this.intraBarDeltaHistory.length < requiredConfirmations) {
+      return { signal: 'hold', reason: `Need ${requiredConfirmations} confirms`, confidence: 0 };
+    }
 
     // Use closed bars for ATR/HTF; breakout & LTF EMA use the forming snapshot
     this.bars3min.push(formingBar);
@@ -610,6 +634,12 @@ export class MNQDeltaTrendCalculator {
     gates: { brokeUp: boolean; brokeDown: boolean; passLong: boolean; passShort: boolean }
   ): TradeSignal {
     const { brokeUp, brokeDown, passLong, passShort } = gates;
+
+    const nowMs = Date.now();
+    const cooldownMs = 2000;
+    if ((nowMs - this.lastIntraBarSignalTime) < cooldownMs) {
+      return { signal: 'hold', reason: 'Intra-bar cooldown', confidence: 0 };
+    }
 
     // ATR gate
     const atr = marketState.atr;
@@ -675,6 +705,7 @@ export class MNQDeltaTrendCalculator {
       }
       this.lastEntryBarTimestamp = formingBar.timestamp;
       this.lastAtrAtSignal = atr;
+      this.lastIntraBarSignalTime = nowMs;
 
       return {
         signal: 'buy',
@@ -690,6 +721,7 @@ export class MNQDeltaTrendCalculator {
       }
       this.lastEntryBarTimestamp = formingBar.timestamp;
       this.lastAtrAtSignal = atr;
+      this.lastIntraBarSignalTime = nowMs;
 
       return {
         signal: 'sell',
@@ -706,6 +738,7 @@ export class MNQDeltaTrendCalculator {
    */
   public resetIntraBarTracking(): void {
     this.intraBarDeltaHistory = [];
+    this.firstDeltaMsInBar = 0;
   }
 
   public clearPosition(): void {
@@ -735,9 +768,26 @@ export class MNQDeltaTrendCalculator {
       if (barsSinceEntry < minBars) return 'none';
     }
 
-    const px = snapToTick(lastPrice);                 // <<< use snapToTick
+    const px = snapToTick(lastPrice);
     const { direction: dir, entryPrice } = this.currentPosition;
-    const { offPts, actPts } = this.fixedTrail;
+
+    // Base = ATR at entry (capped). Re-compute off/act each tick with optional compression if live ATR balloons.
+    const seed = this.fixedTrail.entryATR;
+
+    // Live ATR with fallback to seed
+    const atrLive = Number.isFinite(_atrNow) && _atrNow > 0 ? _atrNow : (this.calculateATR() || seed);
+
+    // Optional dynamic compression: if live ATR > 1.3×seed, shrink distances proportionally (floor 50%)
+    let shrink = 1.0;
+    if (Number.isFinite(atrLive) && atrLive > seed * 1.3) {
+      shrink = Math.max(seed / atrLive, 0.5);
+    }
+
+    const offMult = Number(this.config.trailOffsetATR ?? 0.125);
+    const actMult = Math.max(0, Number(this.config.trailActivationATR ?? 0.30));
+
+    const offPts = seed * offMult * shrink;
+    const actPts = seed * actMult * shrink;
 
     // Use snapped price for activation check
     const reachedActivation =

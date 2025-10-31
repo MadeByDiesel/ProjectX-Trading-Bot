@@ -403,8 +403,7 @@ export class MNQDeltaTrendTrader {
         return;
       }
 
-      const acctBal = await this.client.getEquity();
-      const qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));
+      const qty = Math.max(1, this.config.contractQuantity ?? 1); 
 
       console.info(
         `[MNQDeltaTrend][INTRA-BAR ORDER] ${signal.signal.toUpperCase()} qty=${qty}`,
@@ -519,8 +518,7 @@ export class MNQDeltaTrendTrader {
 
     const direction = signal.signal === 'buy' ? 'long' : 'short';
     const atr = this.marketState.atr ?? 0;
-    const acctBal = await this.client.getEquity();
-    const qty = Math.max(1, this.calculator.calculatePositionSize(bar.close, atr, acctBal));
+    const qty = Math.max(1, this.config.contractQuantity ?? 1);
 
     console.info(`[MNQDeltaTrend][order] ${signal.signal.toUpperCase()} qty=${qty} reason="${signal.reason}"`);
 

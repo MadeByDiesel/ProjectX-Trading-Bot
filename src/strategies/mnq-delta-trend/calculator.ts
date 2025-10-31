@@ -476,14 +476,10 @@ export class MNQDeltaTrendCalculator {
   }
 
   calculatePositionSize(currentPrice: number, atr: number, accountBalance: number): number {
-    void currentPrice;
-    const riskAmount = accountBalance * 0.01;
-    const riskPerContract = atr * (this.config.atrStopLossMultiplier ?? 1);
-    if (!Number.isFinite(riskPerContract) || riskPerContract <= 0) return 1;
-    const size = Math.floor(riskAmount / riskPerContract);
-    return Math.min(Math.max(1, size), this.config.contractQuantity ?? 1);
+    void currentPrice; void atr; void accountBalance;
+    return Math.max(1, this.config.contractQuantity ?? 1);
   }
-
+  
   public setPosition(entryPrice: number, direction: 'long' | 'short', _atrForTrail?: number): void {
     // Prefer explicit ATR from caller; else use the stashed ATR captured at signal time; else compute.
     const atrFromCaller = Number.isFinite(_atrForTrail as number) ? Number(_atrForTrail) : NaN;

@@ -500,12 +500,14 @@ export class MNQDeltaTrendCalculator {
       return;
     }
 
-    // Treat config values as ATR multipliers (Pine parity)
-    const offMult = Number(this.config.trailOffsetATR ?? 0.125);
-    const actMult = Math.max(0, Number(this.config.trailActivationATR ?? 0.30));
+    // --- STOP/T R A I L  MULTIPLIERS (locked to ATR at entry) ---
+    const slMult = Number(this.config.atrStopLossMultiplier ?? 0.20);  // TRUE initial hard stop (not the trail)
+    const offMult = Number(this.config.trailOffsetATR ?? 0.125);       // trail offset distance
+    const actMult = Math.max(0, Number(this.config.trailActivationATR ?? 0.30)); // activation move
 
-    const offPts = atrAtEntry * offMult;
-    const actPts = atrAtEntry * actMult;
+    const slPts  = atrAtEntry * slMult;   // initial hard stop width
+    const offPts = atrAtEntry * offMult;  // trail offset width
+    const actPts = atrAtEntry * actMult;  // trail activation move
 
     this.fixedTrail = { offPts, actPts, entryATR: atrAtEntry };
 
@@ -514,25 +516,22 @@ export class MNQDeltaTrendCalculator {
       entryPrice,
       entryTime: Date.now(),
       direction,
-      stopLoss: 0, // set below after snapping
+      // initial HARD stop = entry ± ATR*slMult (snapped to tick)
+      stopLoss: direction === 'long'
+        ? snapStop(entryPrice - slPts, 'long')
+        : snapStop(entryPrice + slPts, 'short'),
     };
 
-    const rawStop =
-      direction === 'long'
-        ? entryPrice - offPts
-        : entryPrice + offPts;
+    // Start trailing level at the initial HARD stop; trail will only engage after activation
+    this.trailingStopLevel = this.currentPosition.stopLoss;
 
-    // snap initial trail to tick grid
-    this.trailingStopLevel = snapStop(rawStop, direction);
-    this.currentPosition.stopLoss = this.trailingStopLevel;
-
-    console.info('[MNQDeltaTrend][ENTRY:trail-frozen]', {
+    console.info('[MNQDeltaTrend][ENTRY:init]', {
       dir: direction,
       entry: entryPrice,
       entryATR: atrAtEntry,
-      offMult, actMult,
-      offPts, actPts,
-      trailingStopLevel: this.trailingStopLevel
+      slMult, offMult, actMult,
+      slPts, offPts, actPts,
+      stopLoss: this.currentPosition.stopLoss
     });
   }
 

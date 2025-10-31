@@ -1,62 +1,51 @@
-// src/strategies/mnq-delta-trend/calculator.ts
 import { BarData, MarketState, StrategyConfig, TradeSignal } from './types';
 import { TechnicalCalculator } from '../../utils/technical';
 
-console.log('[calc] loaded', __filename);
-
-// --- Tick precision helpers (MNQ = 0.25) ---
+// === Tick helpers (MNQ = 0.25) ===
 const TICK_SIZE = 0.25;
 const snapToTick = (p: number): number => Math.round(p / TICK_SIZE) * TICK_SIZE;
 const snapStop = (p: number, dir: 'long' | 'short'): number =>
-  dir === 'long'
-    ? Math.floor(p / TICK_SIZE) * TICK_SIZE
-    : Math.ceil(p / TICK_SIZE) * TICK_SIZE;
+  dir === 'long' ? Math.floor(p / TICK_SIZE) * TICK_SIZE : Math.ceil(p / TICK_SIZE) * TICK_SIZE;
 
 export class MNQDeltaTrendCalculator {
   private config: StrategyConfig;
   private technical: TechnicalCalculator;
 
-  // Closed bars storage
+  // Closed bars
   private bars3min: BarData[] = [];
   private bars15min: BarData[] = [];
-
   private isWarmUpProcessed = false;
 
-  // Position / trailing
-  private currentPosition: {
-    entryPrice: number;
-    entryTime: number;
-    direction: 'long' | 'short';
-    stopLoss: number;
-  } | null = null;
-
-  // Frozen per-trade trail distances (computed at entry from ATR(entry))
-  private fixedTrail: { offPts: number; actPts: number; entryATR: number } | null = null;
-    // …existing fields…
-  private lastAtrAtSignal: number | null = null;
-
+  // Position / trail
+  private currentPosition: { entryPrice: number; entryTime: number; direction: 'long' | 'short'; stopLoss: number } | null = null;
   private trailingStopLevel = 0;
+  private fixedTrail: { offPts: number; actPts: number; entryATR: number } | null = null;
 
-  // Track HTF bucket to avoid duplicate/new-bar mistakes
+  // HTF bucket tracker
   private lastHTFBucketStartMs: number | null = null;
 
-  // Intra-bar signal tracking
+  // Intrabar state
   private intraBarDeltaHistory: Array<{ delta: number; timestamp: number }> = [];
+  private firstDeltaMsInBar = 0;
+  private lastIntraBarSignalTime = 0;
+
+  // Bar-close gating
   private lastEntryBarTimestamp: string | null = null;
-  private lastIntraBarSignalTime = 0;    // cooldown stamping
-  private firstDeltaMsInBar = 0;         // accumulation start for current bar  
+
+  // Stash ATR at signal time for parity fallback
+  private lastAtrAtSignal: number | null = null;
 
   constructor(config: StrategyConfig) {
     this.config = config;
     this.technical = new TechnicalCalculator();
-    console.info('[MNQDeltaTrend][Config:Calculator]', this.config);
   }
 
-  public getConfig(): Readonly<StrategyConfig> {
-    return this.config;
-  }
+  public getConfig(): Readonly<StrategyConfig> { return this.config; }
+  public hasPosition(): boolean { return !!this.currentPosition; }
+  public getPositionDirection(): 'long' | 'short' | null { return this.currentPosition?.direction ?? null; }
 
-  processWarmUpBar(bar: BarData, timeframe: '3min' | 'HTF'): void {
+  // ===== Warmup / session =====
+  public processWarmUpBar(bar: BarData, timeframe: '3min' | 'HTF'): void {
     const arr = timeframe === '3min' ? this.bars3min : this.bars15min;
 
     const prevClose = arr.length ? arr[arr.length - 1].close : NaN;
@@ -68,9 +57,7 @@ export class MNQDeltaTrendCalculator {
 
     const normalized: BarData = {
       ...bar,
-      delta: (typeof bar.delta === 'number' && Number.isFinite(bar.delta))
-        ? Math.trunc(bar.delta)
-        : Math.trunc(signedVol),
+      delta: Number.isFinite(bar.delta as any) ? Math.trunc(Number(bar.delta)) : Math.trunc(signedVol),
     };
 
     arr.push(normalized);
@@ -78,80 +65,48 @@ export class MNQDeltaTrendCalculator {
     if (timeframe === 'HTF' && this.bars15min.length > 1000) this.bars15min.shift();
   }
 
-  completeWarmUp(): void {
-    this.isWarmUpProcessed = true;
-    if (this.bars3min.length > 0 || this.bars15min.length > 0) {
-      void this.calculateATR();
-      void this.determineTrend();
-    }
-  }
+  public completeWarmUp(): void { this.isWarmUpProcessed = true; }
 
-  processNewBar(incoming: BarData, marketState: MarketState): TradeSignal {
-    if (!this.isWarmUpProcessed) {
-      return { signal: 'hold', reason: 'Warm-up in progress', confidence: 0 };
-    }
-
-    // Session gate
+  private inSession(tsISO: string): boolean {
     try {
       const tz = 'America/New_York';
-      const barTime = new Date(incoming.timestamp);
-      const options: Intl.DateTimeFormatOptions = {
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-        timeZone: tz,
-      };
-      const hhmm = new Intl.DateTimeFormat('en-US', options).format(barTime);
-
-      const [h, m] = hhmm.split(':').map(n => parseInt(n, 10));
-      const currentMinutes = h * 60 + m;
-
+      const t = new Date(tsISO);
+      const fmt = new Intl.DateTimeFormat('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: tz });
+      const [h, m] = fmt.format(t).split(':').map(n => parseInt(n, 10));
+      const now = h * 60 + m;
       const [sh, sm] = (this.config.tradingStartTime ?? '09:30').split(':').map(n => parseInt(n, 10));
       const [eh, em] = (this.config.tradingEndTime ?? '15:55').split(':').map(n => parseInt(n, 10));
-      const startMinutes = sh * 60 + sm;
-      const endMinutes = eh * 60 + em;
-
-      if (currentMinutes < startMinutes || currentMinutes > endMinutes) {
-        return { signal: 'hold', reason: 'Out of session', confidence: 0 };
-      }
-    } catch (err) {
-      console.warn('[MNQDeltaTrend][SessionGate] failed to parse time:', err);
+      return now >= sh * 60 + sm && now <= eh * 60 + em;
+    } catch {
+      return true;
     }
-
-    const prevClose3m = this.bars3min.length ? this.bars3min[this.bars3min.length - 1].close : NaN;
-    const vol = Number.isFinite(incoming.volume as any) ? Number(incoming.volume) : 0;
-    const signedVol =
-      Number.isFinite(prevClose3m) && Number.isFinite(incoming.close)
-        ? (incoming.close > prevClose3m ? vol : incoming.close < prevClose3m ? -vol : 0)
-        : 0;
-
-    const bar: BarData = {
-      ...incoming,
-      delta: (typeof incoming.delta === 'number' && Number.isFinite(incoming.delta))
-        ? Math.trunc(incoming.delta)
-        : Math.trunc(signedVol),
-    };
-
-    this.bars3min.push(bar);
-    if (this.bars3min.length > 2000) this.bars3min.shift();
-
-    this.updateHigherTimeframeBars(bar);
-
-    const atr = this.calculateATR();
-    const trend = this.determineTrend();
-    const { brokeUpCloseTol, brokeDownCloseTol } = this.checkBreakoutCloseTol();
-    const { passLong, passShort } = this.checkLtfEmaFilter();
-
-    marketState.atr = Number.isFinite(atr) ? atr : 0;
-    marketState.higherTimeframeTrend = trend;
-    marketState.deltaCumulative = (marketState.deltaCumulative ?? 0) + (bar.delta ?? 0);
-
-    const exitSignal = this.checkExitConditions(bar, marketState);
-    if (exitSignal) return exitSignal;
-
-    return this.generateSignal(bar, marketState, { brokeUpCloseTol, brokeDownCloseTol, passLong, passShort });
   }
 
+  // ===== ATR (RMA) =====
+  private calculateATR(): number {
+    const n = 14;
+    if (this.bars3min.length < n + 1) return NaN;
+
+    const tr: number[] = [];
+    for (let i = 1; i < this.bars3min.length; i++) {
+      const c = this.bars3min[i], p = this.bars3min[i - 1];
+      tr.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
+    }
+    if (tr.length < n) return NaN;
+
+    let atr = tr.slice(0, n).reduce((a, b) => a + b, 0) / n;
+    for (let i = n; i < tr.length; i++) atr = (atr * (n - 1) + tr[i]) / n;
+    return atr;
+  }
+
+  public atrWithForming(formingBar: BarData): number {
+    this.bars3min.push(formingBar);
+    const a = this.calculateATR();
+    this.bars3min.pop();
+    return a;
+  }
+
+  // ===== Trend / HTF bucketing =====
   private updateHigherTimeframeBars(bar: BarData): void {
     const htfMin = Math.max(1, Number((this.config as any).higherTimeframe ?? 15));
     const stepMs = htfMin * 60 * 1000;
@@ -173,105 +128,7 @@ export class MNQDeltaTrendCalculator {
     if (typeof bar.delta === 'number') last.delta = (last.delta ?? 0) + bar.delta;
   }
 
-  private calculateATR(): number {
-    const period = 14;
-    if (this.bars3min.length < period + 1) return NaN;
-
-    const validTail: Array<{ open: number; high: number; low: number; close: number }> = [];
-    for (let i = this.bars3min.length - 1; i >= 0 && validTail.length < period + 1; i--) {
-      const b = this.bars3min[i];
-      if ([b.open, b.high, b.low, b.close].every(v => Number.isFinite(v))) {
-        validTail.push({ open: b.open, high: b.high, low: b.low, close: b.close });
-      }
-    }
-    if (validTail.length < period + 1) return NaN;
-    validTail.reverse();
-
-    const tr: number[] = [];
-    for (let i = 1; i < validTail.length; i++) {
-      const h = validTail[i].high;
-      const l = validTail[i].low;
-      const prevC = validTail[i - 1].close;
-      tr.push(Math.max(h - l, Math.abs(h - prevC), Math.abs(l - prevC)));
-    }
-    if (tr.length < period) return NaN;
-
-    let atr = tr.slice(0, period).reduce((a, b) => a + b, 0) / period;
-    for (let i = period; i < tr.length; i++) {
-      atr = (atr * (period - 1) + tr[i]) / period;
-    }
-    return atr;
-  }
-
-  // PUBLIC: compute ATR including the current forming bar snapshot (Pine-accurate gate)
-  public atrWithForming(formingBar: BarData): number {
-    this.bars3min.push(formingBar);
-    const atr = this.calculateATR();
-    this.bars3min.pop();
-    return atr;
-  }
-
-  private checkLtfEmaFilter(): { passLong: boolean; passShort: boolean; lastClose: number; lastEma: number } {
-    if (!this.config.useEmaFilter) {
-      const lastClose = this.bars3min.length ? this.bars3min[this.bars3min.length - 1].close : NaN;
-      return { passLong: true, passShort: true, lastClose, lastEma: NaN };
-    }
-
-    const L = Math.max(1, this.config.emaLength ?? 21);
-    const closes = this.bars3min.map(b => b.close);
-    if (closes.length < L) {
-      return { passLong: false, passShort: false, lastClose: NaN, lastEma: NaN };
-    }
-
-    const emaSeries = this.technical.calculateEMA(closes, L);
-    const lastClose = closes[closes.length - 1];
-    const lastEma = emaSeries[emaSeries.length - 1];
-
-    return {
-      passLong: lastClose > lastEma,
-      passShort: lastClose < lastEma,
-      lastClose,
-      lastEma
-    };
-  }
-
-  /**
-   * LTF EMA filter using the **forming** close (Pine-like intrabar update).
-   */
-  private checkLtfEmaFilterWithForming(formingClose: number): { passLong: boolean; passShort: boolean; lastClose: number; lastEma: number } {
-    if (!this.config.useEmaFilter) {
-      return { passLong: true, passShort: true, lastClose: formingClose, lastEma: NaN };
-    }
-
-    const L = Math.max(1, this.config.emaLength ?? 21);
-    const closes = this.bars3min.map(b => b.close);
-
-    if (closes.length === 0) {
-      return { passLong: false, passShort: false, lastClose: NaN, lastEma: NaN };
-    }
-
-    // Compute EMA as-if the forming close is the current close
-    const seed = this.technical.calculateEMA(closes, Math.min(L, closes.length));
-    const lastEmaClosed = seed[seed.length - 1];
-
-    if (!Number.isFinite(lastEmaClosed)) {
-      return { passLong: false, passShort: false, lastClose: NaN, lastEma: NaN };
-    }
-
-    // One-step EMA update with forming close (EMA_k = α*C_k + (1-α)*EMA_{k-1})
-    const alpha = 2 / (L + 1);
-    const emaWithForming = alpha * formingClose + (1 - alpha) * lastEmaClosed;
-
-    return {
-      passLong: formingClose > emaWithForming,
-      passShort: formingClose < emaWithForming,
-      lastClose: formingClose,
-      lastEma: emaWithForming
-    };
-  }
-
   private determineTrend(): 'bullish' | 'bearish' | 'neutral' {
-    if (this.bars15min.length < 2) return 'neutral';
     const L = Math.max(1, this.config.htfEMALength ?? 50);
     const useForming = this.config.htfUseForming === true;
     const lastIdx = useForming ? this.bars15min.length - 1 : this.bars15min.length - 2;
@@ -286,39 +143,197 @@ export class MNQDeltaTrendCalculator {
     return px > ema ? 'bullish' : px < ema ? 'bearish' : 'neutral';
   }
 
+  // ===== Breakout gates =====
   private checkBreakoutIntrabar(formingBar: BarData) {
     const n = Math.max(1, this.config.breakoutLookbackBars ?? 20);
-    if (this.bars3min.length < n) {
-      return { brokeUp: false, brokeDown: false };
-    }
+    if (this.bars3min.length < n) return { brokeUp: false, brokeDown: false };
     const window = this.bars3min.slice(-n);
     const rangeHigh = Math.max(...window.map(b => b.high));
-    const rangeLow  = Math.min(...window.map(b => b.low));
-    return {
-      brokeUp:   formingBar.high > rangeHigh,
-      brokeDown: formingBar.low  < rangeLow,
-    };
+    const rangeLow = Math.min(...window.map(b => b.low));
+    return { brokeUp: formingBar.high > rangeHigh, brokeDown: formingBar.low < rangeLow };
   }
 
   private checkBreakoutCloseTol() {
     const n = Math.max(1, this.config.breakoutLookbackBars ?? 20);
-    if (this.bars3min.length < n) {
-      return { brokeUpCloseTol: false, brokeDownCloseTol: false };
-    }
+    if (this.bars3min.length < n) return { brokeUpCloseTol: false, brokeDownCloseTol: false };
 
     const window = this.bars3min.slice(-n);
     const last = window[window.length - 1];
-
     const rangeHigh = Math.max(...window.map(b => b.high));
-    const rangeLow  = Math.min(...window.map(b => b.low));
+    const rangeLow = Math.min(...window.map(b => b.low));
 
-    return {
-      brokeUpCloseTol:   last.close > rangeHigh * 0.995,
-      brokeDownCloseTol: last.close < rangeLow  * 1.005,
-    };
+    return { brokeUpCloseTol: last.close > rangeHigh * 0.995, brokeDownCloseTol: last.close < rangeLow * 1.005 };
   }
 
-  private checkExitConditions(bar: BarData, _marketState: MarketState): TradeSignal | null {
+  // ===== EMA filter (LTF) =====
+  private checkLtfEmaFilter(): { passLong: boolean; passShort: boolean } {
+    if (!this.config.useEmaFilter) return { passLong: true, passShort: true };
+    const L = Math.max(1, this.config.emaLength ?? 21);
+    const closes = this.bars3min.map(b => b.close);
+    if (closes.length < L) return { passLong: false, passShort: false };
+    const ema = this.technical.calculateEMA(closes, L);
+    const lastClose = closes[closes.length - 1];
+    const lastEma = ema[ema.length - 1];
+    return { passLong: lastClose > lastEma, passShort: lastClose < lastEma };
+  }
+
+  private checkLtfEmaFilterWithForming(formingClose: number): { passLong: boolean; passShort: boolean } {
+    if (!this.config.useEmaFilter) return { passLong: true, passShort: true };
+    const L = Math.max(1, this.config.emaLength ?? 21);
+    const closes = this.bars3min.map(b => b.close);
+    if (closes.length === 0) return { passLong: false, passShort: false };
+    const seed = this.technical.calculateEMA(closes, Math.min(L, closes.length));
+    const lastEmaClosed = seed[seed.length - 1];
+    if (!Number.isFinite(lastEmaClosed)) return { passLong: false, passShort: false };
+    const alpha = 2 / (L + 1);
+    const emaWithForming = alpha * formingClose + (1 - alpha) * lastEmaClosed;
+    return { passLong: formingClose > emaWithForming, passShort: formingClose < emaWithForming };
+  }
+
+  // ===== Delta math =====
+  private smaSignedDelta(n: number, endIndex?: number): number {
+    const end = typeof endIndex === 'number' ? endIndex : this.bars3min.length - 1;
+    if (end < 0) return NaN;
+    const start = Math.max(0, end - n + 1);
+    if (end - start + 1 < n) return NaN;
+    let sum = 0;
+    for (let i = start; i <= end; i++) sum += Number(this.bars3min[i].delta ?? 0);
+    return sum / n;
+  }
+
+  // ===== Bar-close signal =====
+  public processNewBar(incoming: BarData, marketState: MarketState): TradeSignal {
+    if (!this.isWarmUpProcessed || !this.inSession(incoming.timestamp)) return { signal: 'hold', reason: 'session/warmup', confidence: 0 };
+
+    // Normalize delta for the bar
+    const prevClose = this.bars3min.length ? this.bars3min[this.bars3min.length - 1].close : NaN;
+    const vol = Number.isFinite(incoming.volume as any) ? Number(incoming.volume) : 0;
+    const signedVol =
+      Number.isFinite(prevClose) && Number.isFinite(incoming.close)
+        ? (incoming.close > prevClose ? vol : incoming.close < prevClose ? -vol : 0)
+        : 0;
+
+    const bar: BarData = {
+      ...incoming,
+      delta: Number.isFinite(incoming.delta as any) ? Math.trunc(Number(incoming.delta)) : Math.trunc(signedVol),
+    };
+
+    this.bars3min.push(bar);
+    if (this.bars3min.length > 2000) this.bars3min.shift();
+
+    this.updateHigherTimeframeBars(bar);
+
+    const atr = this.calculateATR();
+    const trend = this.determineTrend();
+    marketState.atr = Number.isFinite(atr) ? atr : 0;
+    marketState.higherTimeframeTrend = trend;
+
+    // Exit checks first (bar-close)
+    const exit = this.checkExitConditions(bar);
+    if (exit) return exit;
+
+    // ATR gate
+    const atrThr = this.config.minAtrToTrade ?? 0;
+    if (!(Number.isFinite(atr) && atr > atrThr)) return { signal: 'hold', reason: 'ATR gate', confidence: 0 };
+    const { brokeUpCloseTol, brokeDownCloseTol } = this.checkBreakoutCloseTol();
+    const { passLong, passShort } = this.checkLtfEmaFilter();
+
+    const spike = this.config.deltaSpikeThreshold ?? 750;
+    const len = Math.max(1, this.config.deltaSMALength ?? 20);
+    const deltaSMA = this.smaSignedDelta(len, this.bars3min.length - 1);
+    if (!Number.isFinite(deltaSMA)) return { signal: 'hold', reason: 'Delta SMA not ready', confidence: 0 };
+
+    const mult = this.config.deltaSurgeMultiplier ?? 1.2;
+    const d = bar.delta ?? 0;
+    const passDeltaLong = d > spike && d > deltaSMA * mult;
+    const passDeltaShort = d < -spike && d < deltaSMA * -mult;
+
+    if (passDeltaLong && passLong && brokeUpCloseTol && trend === 'bullish') {
+      this.lastEntryBarTimestamp = bar.timestamp;
+      this.lastAtrAtSignal = atr;
+      return { signal: 'buy', reason: `Δ=${d} > SMA×mult=${(deltaSMA * mult).toFixed(0)}`, confidence: 0.9 };
+    }
+    if (passDeltaShort && passShort && brokeDownCloseTol && trend === 'bearish') {
+      this.lastEntryBarTimestamp = bar.timestamp;
+      this.lastAtrAtSignal = atr;
+      return { signal: 'sell', reason: `Δ=${d} < SMA×mult=${(deltaSMA * -mult).toFixed(0)}`, confidence: 0.9 };
+    }
+
+    return { signal: 'hold', reason: 'no signal', confidence: 0 };
+  }
+
+  // ===== Forming-bar signal =====
+  public evaluateFormingBar(formingBar: BarData, marketState: MarketState): TradeSignal {
+    if (!this.isWarmUpProcessed) return { signal: 'hold', reason: 'warmup', confidence: 0 };
+    if (!this.inSession(formingBar.timestamp)) return { signal: 'hold', reason: 'out of session', confidence: 0 };
+    if (this.hasPosition()) return { signal: 'hold', reason: 'already in position', confidence: 0 };
+
+    const nowMs = Date.now();
+    const delta = formingBar.delta ?? 0;
+
+    this.intraBarDeltaHistory.push({ delta, timestamp: nowMs });
+    if (this.firstDeltaMsInBar === 0) this.firstDeltaMsInBar = nowMs;
+
+    const confirmWindowMs = this.config.intraBarConfirmationWindowMs ?? 500;
+    this.intraBarDeltaHistory = this.intraBarDeltaHistory.filter(e => (nowMs - e.timestamp) <= confirmWindowMs);
+
+    const minAccumMs = this.config.intraBarMinAccumulationMs ?? 5000;
+    if ((nowMs - this.firstDeltaMsInBar) < minAccumMs) return { signal: 'hold', reason: 'accumulating', confidence: 0 };
+
+    const requiredConfirmations = this.config.intraBarConfirmationChecks ?? 3;
+    if (this.intraBarDeltaHistory.length < requiredConfirmations) return { signal: 'hold', reason: 'need confirmations', confidence: 0 };
+
+    // Cooldown
+    const cooldownMs = 2000;
+    if ((nowMs - this.lastIntraBarSignalTime) < cooldownMs) return { signal: 'hold', reason: 'intrabar cooldown', confidence: 0 };
+
+    // ATR gate — Pine-like including forming snapshot
+    const atr = this.atrWithForming(formingBar);
+    marketState.atr = Number.isFinite(atr) ? atr : 0;
+    marketState.higherTimeframeTrend = this.determineTrend();
+
+    const atrThr = this.config.minAtrToTrade ?? 0;
+    if (!(Number.isFinite(atr) && atr > atrThr)) return { signal: 'hold', reason: 'ATR gate forming', confidence: 0 };
+    
+    const { brokeUp, brokeDown } = this.checkBreakoutIntrabar(formingBar);
+    const { passLong, passShort } = this.checkLtfEmaFilterWithForming(formingBar.close);
+
+    const len = Math.max(1, this.config.deltaSMALength ?? 20);
+    const deltaSMA = this.smaSignedDelta(len, this.bars3min.length - 1);
+    if (!Number.isFinite(deltaSMA)) return { signal: 'hold', reason: 'Delta SMA not ready', confidence: 0 };
+
+    const spike = this.config.deltaSpikeThreshold ?? 750;
+    const mult = this.config.deltaSurgeMultiplier ?? 1.2;
+    const longThr = deltaSMA * mult;
+    const shortThr = deltaSMA * -mult;
+
+    const allConfirmLong = this.intraBarDeltaHistory.every(e => e.delta > spike && e.delta > longThr);
+    const allConfirmShort = this.intraBarDeltaHistory.every(e => e.delta < -spike && e.delta < shortThr);
+
+    const passDeltaLong = delta > spike && delta > longThr && allConfirmLong;
+    const passDeltaShort = delta < -spike && delta < shortThr && allConfirmShort;
+
+    const trend = marketState.higherTimeframeTrend;
+
+    if (passDeltaLong && passLong && brokeUp && trend === 'bullish') {
+      this.lastIntraBarSignalTime = nowMs;
+      this.lastEntryBarTimestamp = formingBar.timestamp;
+      this.lastAtrAtSignal = atr;
+      return { signal: 'buy', reason: `[INTRA] Δ=${delta} > ${longThr.toFixed(0)} (${this.intraBarDeltaHistory.length} conf)`, confidence: 0.85 };
+    }
+
+    if (passDeltaShort && passShort && brokeDown && trend === 'bearish') {
+      this.lastIntraBarSignalTime = nowMs;
+      this.lastEntryBarTimestamp = formingBar.timestamp;
+      this.lastAtrAtSignal = atr;
+      return { signal: 'sell', reason: `[INTRA] Δ=${delta} < ${shortThr.toFixed(0)} (${this.intraBarDeltaHistory.length} conf)`, confidence: 0.85 };
+    }
+
+    return { signal: 'hold', reason: 'no intrabar signal', confidence: 0 };
+  }
+
+  // ===== Exit checks (bar-close) =====
+  private checkExitConditions(bar: BarData): TradeSignal | null {
     if (!this.currentPosition) return null;
 
     const { entryTime, direction } = this.currentPosition;
@@ -326,441 +341,73 @@ export class MNQDeltaTrendCalculator {
     const barsSinceEntry = this.bars3min.filter(b => new Date(b.timestamp).getTime() > entryTime).length;
     if (barsSinceEntry < minBars) return null;
 
-    const trail = this.trailingStopLevel;
-    if (!Number.isFinite(trail)) return null;
-
     const stop = this.currentPosition.stopLoss;
+    const trail = this.trailingStopLevel;
 
-    if (direction === 'long' && bar.low <= stop) {
-      return { signal: 'sell', reason: `Hit stop (${stop.toFixed(2)})`, confidence: 1.0 };
-    }
-    if (direction === 'short' && bar.high >= stop) {
-      return { signal: 'buy', reason: `Hit stop (${stop.toFixed(2)})`, confidence: 1.0 };
-    }
-
-    if (direction === 'long'  && bar.low  <= trail) {
-      return { signal: 'sell', reason: `Hit trail (${trail.toFixed(2)})`, confidence: 1.0 };
-    }
-    if (direction === 'short' && bar.high >= trail) {
-      return { signal: 'buy',  reason: `Hit trail (${trail.toFixed(2)})`, confidence: 1.0 };
+    if (direction === 'long') {
+      if (bar.low <= stop) return { signal: 'sell', reason: `Hit stop (${stop.toFixed(2)})`, confidence: 1.0 };
+      if (bar.low <= trail) return { signal: 'sell', reason: `Hit trail (${trail.toFixed(2)})`, confidence: 1.0 };
+    } else {
+      if (bar.high >= stop) return { signal: 'buy', reason: `Hit stop (${stop.toFixed(2)})`, confidence: 1.0 };
+      if (bar.high >= trail) return { signal: 'buy', reason: `Hit trail (${trail.toFixed(2)})`, confidence: 1.0 };
     }
     return null;
   }
 
-  private checkDeltaSlopeExit(direction: 'long' | 'short'): TradeSignal | null {
-    const n = Math.max(1, this.config.deltaSlopeExitLength ?? 5);
-    if (this.bars3min.length < n + 1) return null;
-    const smaNow = this.smaOfDelta(n, this.bars3min.length - 1);
-    const smaPrev = this.smaOfDelta(n, this.bars3min.length - 2);
-    if (!Number.isFinite(smaNow) || !Number.isFinite(smaPrev)) return null;
-    const slope = smaNow - smaPrev;
-    if (direction === 'long' && slope < 0) return { signal: 'sell', reason: 'Delta slope turning negative', confidence: 0.7 };
-    if (direction === 'short' && slope > 0) return { signal: 'buy', reason: 'Delta slope turning positive', confidence: 0.7 };
-    return null;
-  }
-
-  private smaOfDelta(n: number, endIndex: number): number {
-    if (endIndex < 0) return NaN;
-    const start = Math.max(0, endIndex - n + 1);
-    if (endIndex - start + 1 < n) return NaN;
-    let sum = 0;
-    for (let i = start; i <= endIndex; i++) {
-      sum += Math.abs(this.bars3min[i].delta ?? (this.bars3min[i].close - this.bars3min[i].open));
-    }
-    return sum / n;
-  }
-
-  private smaSignedDelta(n: number, endIndex: number): number {
-    if (endIndex < 0) return NaN;
-    const start = Math.max(0, endIndex - n + 1);
-    if (endIndex - start + 1 < n) return NaN;
-    let sum = 0;
-    for (let i = start; i <= endIndex; i++) {
-      const d = (this.bars3min[i].delta ?? (this.bars3min[i].close - (this.bars3min[i - 1]?.close ?? this.bars3min[i].open)));
-      sum += Number(d) || 0;
-    }
-    return sum / n;
-  }
-
-  private generateSignal(
-    bar: BarData,
-    marketState: MarketState,
-    gates: { brokeUpCloseTol: boolean; brokeDownCloseTol: boolean; passLong: boolean; passShort: boolean }
-  ): TradeSignal {
-    const { brokeUpCloseTol, brokeDownCloseTol, passLong, passShort } = gates;
-
-    // Per-bar cooldown: prevent same-bar re-entry at bar close
-    if (this.lastEntryBarTimestamp === bar.timestamp) {
-      return { signal: 'hold', reason: 'Cooldown: same bar already triggered', confidence: 0 };
-    }
-
-    // ATR gate
-    const atr = marketState.atr;
-    const atrThreshold = this.config.minAtrToTrade ?? 0;
-    
-    if (!(Number.isFinite(atr) && atr > atrThreshold)) {
-      return {
-        signal: 'hold',
-        reason: `ATR gate failed (${atr?.toFixed(2) ?? 'NaN'} <= ${atrThreshold})`,
-        confidence: 0
-      };
-    }
-
-    const spike = this.config.deltaSpikeThreshold ?? 750;
-    const delta = bar.delta ?? 0;
-
-    const len = Math.max(1, this.config.deltaSMALength ?? 20);
-    const deltaSMA = this.smaSignedDelta(len, this.bars3min.length - 1);
-    
-    if (!Number.isFinite(deltaSMA)) {
-      return { signal: 'hold', reason: 'Delta SMA not ready', confidence: 0 };
-    }
-
-    const surgeMult = this.config.deltaSurgeMultiplier ?? 1.0;
-
-    const passDeltaLong = (
-      delta > spike && 
-      delta > (deltaSMA * surgeMult)
-    );
-
-    const passDeltaShort = (
-      delta < -spike && 
-      delta < (deltaSMA * -surgeMult)  // FIXED: negative threshold
-    );
-
-    const absDelta = Math.abs(delta);
-
-    console.debug('[MNQDeltaTrend][deltaCheck]', {
-      delta,
-      absDelta,
-      spike,
-      deltaSMA,
-      surgeMult,
-      longThreshold: deltaSMA * surgeMult,
-      shortThreshold: deltaSMA * -surgeMult,
-      passDeltaLong,
-      passDeltaShort,
-    });
-
-    const htf = marketState.higherTimeframeTrend;
-
-    // Long entry
-    if (passDeltaLong && htf === 'bullish' && brokeUpCloseTol) {
-      if (this.config.useEmaFilter && !passLong) {
-        return { signal: 'hold', reason: 'LTF EMA long filter not passed', confidence: 0 };
-      }
-      this.lastEntryBarTimestamp = bar.timestamp;
-      this.lastAtrAtSignal = atr;                           // <-- ADD THIS LINE
-
-      return { 
-        signal: 'buy', 
-        reason: `Δ=${delta.toFixed(0)} > spike=${spike} & > SMA×mult=${(deltaSMA * surgeMult).toFixed(0)}, bullish HTF, breakout`, 
-        confidence: 0.9 
-      };
-    }
-
-    // Short entry
-    if (passDeltaShort && htf === 'bearish' && brokeDownCloseTol) {
-      if (this.config.useEmaFilter && !passShort) {
-        return { signal: 'hold', reason: 'LTF EMA short filter not passed', confidence: 0 };
-      }
-      this.lastEntryBarTimestamp = bar.timestamp;
-      this.lastAtrAtSignal = atr;                           // <-- ADD THIS LINE
-
-      return { 
-        signal: 'sell', 
-        reason: `Δ=${delta.toFixed(0)} < -spike=${-spike} & < SMA×(-mult)=${(deltaSMA * -surgeMult).toFixed(0)}, bearish HTF, breakdown`, 
-        confidence: 0.9 
-      };
-    }
-
-    return { signal: 'hold', reason: 'No strong signal', confidence: 0 };
-  }
-
-  calculatePositionSize(currentPrice: number, atr: number, accountBalance: number): number {
-    void currentPrice; void atr; void accountBalance;
-    return Math.max(1, this.config.contractQuantity ?? 1);
-  }
-  
-  public setPosition(entryPrice: number, direction: 'long' | 'short', _atrForTrail?: number): void {
-    // Prefer explicit ATR from caller; else use the stashed ATR captured at signal time; else compute.
-    const atrFromCaller = Number.isFinite(_atrForTrail as number) ? Number(_atrForTrail) : NaN;
-    const atrFromStash  = Number.isFinite(this.lastAtrAtSignal as number) ? Number(this.lastAtrAtSignal) : NaN;
-    const computedATR   = this.calculateATR();
-
-    const atrAtEntry =
-      Number.isFinite(atrFromCaller) ? atrFromCaller :
-      Number.isFinite(atrFromStash)  ? atrFromStash  :
-      computedATR;
-
-    if (!Number.isFinite(atrAtEntry) || atrAtEntry <= 0) {
-      console.warn('[MNQDeltaTrend][ENTRY] Aborted: invalid ATR at entry', { atrAtEntry });
-      return;
-    }
-
-    // --- ATR cap at entry + compressed SL multiplier if ATR > cap ---
-    const ATR_CAP = (this as any).config?.atrCap ?? 24;               // points
-    const baseSlMult = Number(this.config.atrStopLossMultiplier ?? 0.20);
-    const offMult    = Number(this.config.trailOffsetATR ?? 0.125);
-    const actMult    = Math.max(0, Number(this.config.trailActivationATR ?? 0.30));
-
-    // Cap the seed used for all entry-locked math
-    const atrSeed = Math.min(atrAtEntry, ATR_CAP);
-
-    // If raw ATR > cap, compress SL multiplier proportionally so SL distance never exceeds cap*baseMult
-    const slMult = (atrAtEntry > ATR_CAP)
-      ? baseSlMult * (ATR_CAP / atrAtEntry)
-      : baseSlMult;
-
-    // Distances (from capped seed and possibly compressed SL multiplier)
-    const slPts  = atrSeed * slMult;
-    const offPts = atrSeed * offMult;
-    const actPts = atrSeed * actMult;
-
-    // Store only the entry ATR seed; off/act will be re-derived (with optional compression) on each tick
-    this.fixedTrail = { offPts, actPts, entryATR: atrSeed };
-
-    // Initialize position
-    this.currentPosition = {
-      entryPrice,
-      entryTime: Date.now(),
-      direction,
-      // initial HARD stop = entry ± ATR*slMult (snapped to tick)
-      stopLoss: direction === 'long'
-        ? snapStop(entryPrice - slPts, 'long')
-        : snapStop(entryPrice + slPts, 'short'),
-    };
-
-    // Start trailing level at the initial HARD stop; trail will only engage after activation
-    this.trailingStopLevel = this.currentPosition.stopLoss;
-
-    console.info('[MNQDeltaTrend][ENTRY:init]', {
-      dir: direction,
-      entry: entryPrice,
-      entryATR: atrAtEntry,
-      slMult, offMult, actMult,
-      slPts, offPts, actPts,
-      stopLoss: this.currentPosition.stopLoss
-    });
-  }
-
-  /**
-   * Evaluate a forming (incomplete) bar for intra-bar signal generation.
-   */
-  public evaluateFormingBar(
-    formingBar: BarData,
-    marketState: MarketState,
-  ): TradeSignal {
-    if (!this.isWarmUpProcessed) {
-      return { signal: 'hold', reason: 'Warm-up incomplete', confidence: 0 };
-    }
-
-    if (this.hasPosition()) {
-      return { signal: 'hold', reason: 'Already in position', confidence: 0 };
-    }
-
-    // Session gate
-    try {
-      const tz = 'America/New_York';
-      const barTime = new Date(formingBar.timestamp);
-      const options: Intl.DateTimeFormatOptions = {
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-        timeZone: tz,
-      };
-      const hhmm = new Intl.DateTimeFormat('en-US', options).format(barTime);
-      const [h, m] = hhmm.split(':').map(n => parseInt(n, 10));
-      const currentMinutes = h * 60 + m;
-      const [sh, sm] = (this.config.tradingStartTime ?? '09:30').split(':').map(n => parseInt(n, 10));
-      const [eh, em] = (this.config.tradingEndTime ?? '15:55').split(':').map(n => parseInt(n, 10));
-      const startMinutes = sh * 60 + sm;
-      const endMinutes = eh * 60 + em;
-
-      if (currentMinutes < startMinutes || currentMinutes > endMinutes) {
-        return { signal: 'hold', reason: 'Out of session', confidence: 0 };
-      }
-    } catch (err) {
-      console.warn('[MNQDeltaTrend][FormingBar] session check failed:', err);
-    }
-
-    const nowMs = Date.now();
-    const delta = formingBar.delta ?? 0;
-    
-    this.intraBarDeltaHistory.push({ delta, timestamp: nowMs });
-    if (this.firstDeltaMsInBar === 0) this.firstDeltaMsInBar = nowMs;
-    
-    const confirmWindowMs = this.config.intraBarConfirmationWindowMs ?? 500;
-    this.intraBarDeltaHistory = this.intraBarDeltaHistory.filter(
-      entry => (nowMs - entry.timestamp) <= confirmWindowMs
-    );
-
-    const minAccumMs = this.config.intraBarMinAccumulationMs ?? 5000;
-    if ((nowMs - this.firstDeltaMsInBar) < minAccumMs) {
-      return { signal: 'hold', reason: `Accumulation < ${minAccumMs}ms`, confidence: 0 };
-    }
-
-    const requiredConfirmations = this.config.intraBarConfirmationChecks ?? 3;
-    if (this.intraBarDeltaHistory.length < requiredConfirmations) {
-      return { signal: 'hold', reason: `Need ${requiredConfirmations} confirms`, confidence: 0 };
-    }
-
-    // Use closed bars for ATR/HTF; breakout & LTF EMA use the forming snapshot
-    this.bars3min.push(formingBar);
-    const atr = this.calculateATR();
-    this.bars3min.pop();
-    const trend = this.determineTrend();
-    const { brokeUp, brokeDown } = this.checkBreakoutIntrabar(formingBar);
-    const { passLong, passShort } = this.checkLtfEmaFilterWithForming(formingBar.close);
-
-    marketState.atr = Number.isFinite(atr) ? atr : 0;
-    marketState.higherTimeframeTrend = trend;
-
-    const signal = this.generateSignalForFormingBar(
-      formingBar, 
-      marketState, 
-      { brokeUp, brokeDown, passLong, passShort } 
-    );
-
-  return signal;
-  }
-
-  /**
-   * Generate signal based on forming bar delta and closed bar indicators.
-   */
-  private generateSignalForFormingBar(
-    formingBar: BarData,
-    marketState: MarketState,
-    gates: { brokeUp: boolean; brokeDown: boolean; passLong: boolean; passShort: boolean }
-  ): TradeSignal {
-    const { brokeUp, brokeDown, passLong, passShort } = gates;
-
-    const nowMs = Date.now();
-    const cooldownMs = 2000;
-    if ((nowMs - this.lastIntraBarSignalTime) < cooldownMs) {
-      return { signal: 'hold', reason: 'Intra-bar cooldown', confidence: 0 };
-    }
-
-    // ATR gate
-    const atr = marketState.atr;
-    const atrThreshold = this.config.minAtrToTrade ?? 0;
-    
-    if (!(Number.isFinite(atr) && atr > atrThreshold)) {
-      return {
-        signal: 'hold',
-        reason: `ATR gate failed (forming bar)`,
-        confidence: 0
-      };
-    }
-
-    const spike = this.config.deltaSpikeThreshold ?? 750;
-    const delta = formingBar.delta ?? 0;
-
-    // Use last CLOSED bar's SMA
-    const len = Math.max(1, this.config.deltaSMALength ?? 20);
-    const deltaSMA = this.smaSignedDelta(len, this.bars3min.length - 1);
-    
-    if (!Number.isFinite(deltaSMA)) {
-      return { signal: 'hold', reason: 'Delta SMA not ready', confidence: 0 };
-    }
-
-    const surgeMult = this.config.deltaSurgeMultiplier ?? 1.0;
-
-    // Safeguard 4: All confirmations must pass
-    const longThreshold = deltaSMA * surgeMult;
-    const shortThreshold = deltaSMA * -surgeMult;
-    
-    const allConfirmLong = this.intraBarDeltaHistory.every(
-      entry => entry.delta > spike && entry.delta > longThreshold
-    );
-    
-    const allConfirmShort = this.intraBarDeltaHistory.every(
-      entry => entry.delta < -spike && entry.delta < shortThreshold
-    );
-
-    const passDeltaLong = (delta > spike && delta > longThreshold && allConfirmLong);
-    const passDeltaShort = (delta < -spike && delta < shortThreshold && allConfirmShort);
-
-    console.debug('[MNQDeltaTrend][formingBarCheck]', {
-      delta,
-      spike,
-      deltaSMA,
-      surgeMult,
-      longThreshold,
-      shortThreshold,
-      confirmations: this.intraBarDeltaHistory.length,
-      allConfirmLong,
-      allConfirmShort,
-      passDeltaLong,
-      passDeltaShort,
-      formingPrice: formingBar.close,
-    });
-
-    const htf = marketState.higherTimeframeTrend;
-
-    // Long entry — FORMING BAR
-    if (passDeltaLong && htf === 'bullish' && brokeUp) {
-      if (this.config.useEmaFilter && !passLong) {
-        return { signal: 'hold', reason: 'LTF EMA long filter (forming)', confidence: 0 };
-      }
-      this.lastEntryBarTimestamp = formingBar.timestamp;
-      this.lastAtrAtSignal = atr;
-      this.lastIntraBarSignalTime = nowMs;
-
-      return {
-        signal: 'buy',
-        reason: `[INTRA-BAR] Δ=${delta.toFixed(0)} > ${spike} & > ${longThreshold.toFixed(0)} (${this.intraBarDeltaHistory.length} confirms), bullish HTF, breakout`,
-        confidence: 0.85
-      };
-    }
-
-    // Short entry — FORMING BAR  (FIX: mirrors long branch; correct breakout gate; stamps timestamp+ATR)
-    if (passDeltaShort && htf === 'bearish' && brokeDown) {
-      if (this.config.useEmaFilter && !passShort) {
-        return { signal: 'hold', reason: 'LTF EMA short filter (forming)', confidence: 0 };
-      }
-      this.lastEntryBarTimestamp = formingBar.timestamp;
-      this.lastAtrAtSignal = atr;
-      this.lastIntraBarSignalTime = nowMs;
-
-      return {
-        signal: 'sell',
-        reason: `[INTRA-BAR] Δ=${delta.toFixed(0)} < ${-spike} & < ${shortThreshold.toFixed(0)} (${this.intraBarDeltaHistory.length} confirms), bearish HTF, breakdown`,
-        confidence: 0.85
-      };
-    }
-
-    return { signal: 'hold', reason: 'No intra-bar signal', confidence: 0 };
-  }
-
-  /**
-   * Reset intra-bar tracking when a new bar starts.
-   */
+  // ===== Intra-bar management =====
   public resetIntraBarTracking(): void {
     this.intraBarDeltaHistory = [];
     this.firstDeltaMsInBar = 0;
+  }
+
+  public clearCooldowns(): void {
+    this.lastIntraBarSignalTime = 0;
+    this.lastEntryBarTimestamp = null;
+  }
+
+  // ===== Position / Trail =====
+  public setPosition(entryPrice: number, direction: 'long' | 'short', _atrForTrail?: number): void {
+    // Seed ATR: prefer caller; else stashed at signal; else compute
+    const caller = Number.isFinite(_atrForTrail as number) ? Number(_atrForTrail) : NaN;
+    const stash = Number.isFinite(this.lastAtrAtSignal as number) ? Number(this.lastAtrAtSignal) : NaN;
+    const computed = this.calculateATR();
+
+    const atrAtEntry = Number.isFinite(caller) ? caller : Number.isFinite(stash) ? stash : computed;
+    if (!Number.isFinite(atrAtEntry) || atrAtEntry <= 0) return;
+
+    // ATR cap at entry (configurable)
+    const ATR_CAP = (this.config as any).atrCap ?? 24;
+    const baseSlMult = Number(this.config.atrStopLossMultiplier ?? 0.20);
+    const offMult = Number(this.config.trailOffsetATR ?? 0.125);
+    const actMult = Math.max(0, Number(this.config.trailActivationATR ?? 0.30));
+
+    const seed = Math.min(atrAtEntry, ATR_CAP);
+    const slPts = seed * baseSlMult;
+    const offPts = seed * offMult;
+    const actPts = seed * actMult;
+
+    this.fixedTrail = { offPts, actPts, entryATR: seed };
+
+    const stop = direction === 'long' ? snapStop(entryPrice - slPts, 'long') : snapStop(entryPrice + slPts, 'short');
+
+    this.currentPosition = { entryPrice, entryTime: Date.now(), direction, stopLoss: stop };
+    this.trailingStopLevel = stop;
   }
 
   public clearPosition(): void {
     this.currentPosition = null;
     this.trailingStopLevel = 0;
     this.fixedTrail = null;
-    this.lastAtrAtSignal = null;      // <-- ADD THIS LINE
-  }
-
-  public hasPosition(): boolean {
-    return !!this.currentPosition;
-  }
-
-  public getPositionDirection(): 'long' | 'short' | null {
-    return this.currentPosition?.direction ?? null;
+    this.lastAtrAtSignal = null;
+    this.lastEntryBarTimestamp = null;
+    this.lastIntraBarSignalTime = 0;
   }
 
   public onTickForProtectiveStops(lastPrice: number, _atrNow: number): 'none' | 'hitStop' | 'hitTrail' {
     if (!this.currentPosition || !Number.isFinite(lastPrice)) return 'none';
     if (!this.fixedTrail) return 'none';
 
-      // Pine parity — defer trail until canExit (minBarsBeforeExit)
+    // Honor minBarsBeforeExit before trailing engages
     const minBars = Math.max(0, this.config.minBarsBeforeExit ?? 0);
     if (minBars > 0) {
       const { entryTime } = this.currentPosition;
@@ -771,31 +418,24 @@ export class MNQDeltaTrendCalculator {
     const px = snapToTick(lastPrice);
     const { direction: dir, entryPrice } = this.currentPosition;
 
-    // Base = ATR at entry (capped). Re-compute off/act each tick with optional compression if live ATR balloons.
     const seed = this.fixedTrail.entryATR;
-
-    // Live ATR with fallback to seed
     const atrLive = Number.isFinite(_atrNow) && _atrNow > 0 ? _atrNow : (this.calculateATR() || seed);
 
-    // Optional dynamic compression: if live ATR > 1.3×seed, shrink distances proportionally (floor 50%)
+    // Optional live compression to avoid runaway ATR-inflation trails
     let shrink = 1.0;
     if (Number.isFinite(atrLive) && atrLive > seed * 1.3) {
       shrink = Math.max(seed / atrLive, 0.5);
     }
 
-    const offMult = Number(this.config.trailOffsetATR ?? 0.125);
-    const actMult = Math.max(0, Number(this.config.trailActivationATR ?? 0.30));
+    const offPts = this.fixedTrail.offPts * shrink;
+    const actPts = this.fixedTrail.actPts * shrink;
 
-    const offPts = seed * offMult * shrink;
-    const actPts = seed * actMult * shrink;
-
-    // Use snapped price for activation check
     const reachedActivation =
-      (dir === 'long'  && (px - entryPrice) >= actPts) ||
+      (dir === 'long' && (px - entryPrice) >= actPts) ||
       (dir === 'short' && (entryPrice - px) >= actPts);
 
     if (!reachedActivation) {
-      // ensure stored stop is snapped
+      // keep stops snapped
       this.trailingStopLevel = snapStop(this.trailingStopLevel, dir);
       this.currentPosition.stopLoss = this.trailingStopLevel;
 
@@ -807,22 +447,16 @@ export class MNQDeltaTrendCalculator {
     }
 
     if (dir === 'long') {
-      const candidateRaw = px - offPts;
-      const candidate = snapStop(candidateRaw, dir);           // <<< snap candidate
+      const candidate = snapStop(px - offPts, 'long');
       if (candidate > this.trailingStopLevel) this.trailingStopLevel = candidate;
       this.currentPosition.stopLoss = this.trailingStopLevel;
-      if (px <= this.trailingStopLevel) return 'hitTrail';     // <<< compare snapped px
+      if (px <= this.trailingStopLevel) return 'hitTrail';
     } else {
-      const candidateRaw = px + offPts;
-      const candidate = snapStop(candidateRaw, dir);           // <<< snap candidate
+      const candidate = snapStop(px + offPts, 'short');
       if (candidate < this.trailingStopLevel) this.trailingStopLevel = candidate;
       this.currentPosition.stopLoss = this.trailingStopLevel;
-      if (px >= this.trailingStopLevel) return 'hitTrail';     // <<< compare snapped px
+      if (px >= this.trailingStopLevel) return 'hitTrail';
     }
     return 'none';
-  }
-
-  public getWarmUpStatus() {
-    return { isComplete: this.isWarmUpProcessed, bars3min: this.bars3min.length, bars15min: this.bars15min.length };
   }
 }

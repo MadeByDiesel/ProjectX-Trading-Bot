@@ -52,5 +52,16 @@ export const MNQ_DELTA_TREND_CONFIG: StrategyConfig = {
   intraBarConfirmationWindowMs: 500,            // Within 500ms window
 
   sendWebhook: false,
-  webhookUrl: '' //'http://192.168.4.170:8080/signal?secret=toast',
+  webhookUrl: '', //'http://192.168.4.170:8080/signal?secret=toast',
+
+  // ===== NEW: CVD slope gate (OFF by default) =====
+  useCvdSlopeGate: false,
+  cvdSlopeLen: 3,
+  cvdSlopeMinAbs: 0,
+
+  // ===== NEW: Cluster guard (OFF by default) =====
+  useClusterGuard: false,
+  clusterAheadTicks: 8,
+  clusterMinVolume: 200,
+  clusterImbalanceThreshold: 0.65,
 };

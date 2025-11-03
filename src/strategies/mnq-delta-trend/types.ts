@@ -52,6 +52,17 @@ export interface StrategyConfig {
   intraBarMinAccumulationMs?: number;       // Min time before first check (default: 5000ms = 5 seconds)
   intraBarConfirmationChecks?: number;      // Consecutive checks required (default: 3)
   intraBarConfirmationWindowMs?: number;    // Time window for confirmations (default: 500ms)
+
+  // ===== NEW: CVD slope gate (optional; OFF by default) =====
+  useCvdSlopeGate?: boolean;     // default false
+  cvdSlopeLen?: number;          // default 3
+  cvdSlopeMinAbs?: number;       // default 0
+
+  // ===== NEW: Order-flow cluster guard (optional; OFF by default) =====
+  useClusterGuard?: boolean;         // default false
+  clusterAheadTicks?: number;        // default 8
+  clusterMinVolume?: number;         // default 200
+  clusterImbalanceThreshold?: number;// default 0.65
 }
 
 // === Bar / Market / Signal types used by calculator & trader ===

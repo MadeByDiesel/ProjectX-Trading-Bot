@@ -72,7 +72,15 @@ router.put('/config', async (req: Request, res: Response) => {
       // Trailing
       'useTrailingStop',           // ← add
       'trailActivationATR',
-      'trailOffsetATR'
+      'trailOffsetATR',
+        // --- Order Flow (new) ---
+      'useCvdSlopeGate',
+      'cvdSlopeLen',
+      'cvdSlopeMinAbs',
+      'useClusterGuard',
+      'clusterAheadTicks',
+      'clusterMinVolume',
+      'clusterImbalanceThreshold'
     ];
 
     const body = req.body ?? {};

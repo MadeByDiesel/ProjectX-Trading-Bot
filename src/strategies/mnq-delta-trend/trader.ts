@@ -177,9 +177,6 @@ export class MNQDeltaTrendTrader {
             this.calculator.clearPosition();
             this.isFlattening = false;
 
-            // Allow bar-close path to re-enter this same bar after an intrabar scratch
-            this.enteredBarStartMs = null;
-
             if ((this.config as any).sendWebhook) this.postWebhook('FLAT');
           })
           .catch((err) => {

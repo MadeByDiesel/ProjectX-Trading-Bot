@@ -355,7 +355,7 @@ private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
 
   private onDepth(d: { contractId: string; timestamp: string; type: number; price: number; volume: number; currentVolume: number }): void {
     // console.info('[MNQDeltaTrend][Depth][RAW]', { contractId: d.contractId, keys: Object.keys(d as any), raw: d });
-    console.debug('[MNQDeltaTrend][Depth->Trader]', { id: d.contractId, type: d.type, price: d.price, vol: (d as any).currentVolume ?? d.volume });
+    // console.debug('[MNQDeltaTrend][Depth->Trader]', { id: d.contractId, type: d.type, price: d.price, vol: (d as any).currentVolume ?? d.volume });
 
     if (!this.depthLogOnce) {
       console.info(`[MNQDeltaTrend][Depth:first] ${d.contractId} px=${d.price} vol=${d.volume ?? d.currentVolume} type=${d.type}`);

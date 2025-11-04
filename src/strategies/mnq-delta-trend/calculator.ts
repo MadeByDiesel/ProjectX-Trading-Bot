@@ -35,9 +35,18 @@ export class MNQDeltaTrendCalculator {
   // Stash ATR at signal time for parity fallback
   private lastAtrAtSignal: number | null = null;
 
+  private regimeState = {
+    current: 'Normal' as 'Chop' | 'Normal' | 'Trend',
+    atrSamples: [] as number[],
+    cvdSlopeSamples: [] as number[],
+  };
+
+  private baseConfig!: Readonly<StrategyConfig>;
+
   constructor(config: StrategyConfig) {
     this.config = config;
     this.technical = new TechnicalCalculator();
+     this.baseConfig = JSON.parse(JSON.stringify(config));
   }
 
   public getConfig(): Readonly<StrategyConfig> { return this.config; }
@@ -201,6 +210,56 @@ export class MNQDeltaTrendCalculator {
     return sum / n;
   }
 
+   private updateRegime(atrValue: number, cvdSlope: number): void {
+    const s = this.regimeState;
+
+    if (Number.isFinite(atrValue)) s.atrSamples.push(atrValue);
+    s.cvdSlopeSamples.push(Math.abs(cvdSlope));
+    if (s.atrSamples.length > 20) s.atrSamples.shift();
+    if (s.cvdSlopeSamples.length > 20) s.cvdSlopeSamples.shift();
+
+    const mean = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / Math.max(1, arr.length);
+    const atrMean = s.atrSamples.length ? mean(s.atrSamples) : Number(atrValue || 0);
+    const cvdMean = s.cvdSlopeSamples.length ? mean(s.cvdSlopeSamples) : Math.abs(cvdSlope);
+    const cvdStd = Math.sqrt(
+      s.cvdSlopeSamples.map(v => (v - cvdMean) ** 2).reduce((a, b) => a + b, 0) / Math.max(1, s.cvdSlopeSamples.length)
+    );
+
+    let next: 'Chop' | 'Normal' | 'Trend' = 'Normal';
+    if (Number.isFinite(atrValue) && atrValue < atrMean * 0.8 && cvdStd < cvdMean * 0.8) next = 'Chop';
+    else if ((Number.isFinite(atrValue) && atrValue > atrMean * 1.2) || cvdStd > cvdMean * 1.2) next = 'Trend';
+
+    if (next !== s.current) {
+      console.info(`[Regime] ${s.current}→${next} | ATR=${Number(atrValue).toFixed(2)} | dCVDσ=${cvdStd.toFixed(0)}`);
+      s.current = next;
+    }
+  }
+
+  private applyRegimeScaling(): void {
+    // reset to baseline first
+    Object.assign(this.config, this.baseConfig);
+
+    const r = this.regimeState.current;
+    const c = this.config as any;
+    const scale = (v: number, m: number) => Number((v * m).toFixed(4));
+
+    if (r === 'Chop') {
+      c.deltaSpikeThreshold = scale(c.deltaSpikeThreshold, 1.30);
+      c.minAtrToTrade      = scale(c.minAtrToTrade,      1.20);
+      c.trailActivationATR = scale(c.trailActivationATR, 1.30);
+      c.trailOffsetATR     = scale(c.trailOffsetATR,     1.30);
+      if (c.cvdSlopeMinAbs !== undefined) c.cvdSlopeMinAbs = scale(c.cvdSlopeMinAbs, 1.50);
+      if (c.clusterMinVolume !== undefined) c.clusterMinVolume = Math.round(c.clusterMinVolume * 1.30);
+    } else if (r === 'Trend') {
+      c.deltaSpikeThreshold = scale(c.deltaSpikeThreshold, 0.85);
+      c.minAtrToTrade      = scale(c.minAtrToTrade,      0.80);
+      c.trailActivationATR = scale(c.trailActivationATR, 0.75);
+      c.trailOffsetATR     = scale(c.trailOffsetATR,     0.75);
+      if (c.cvdSlopeMinAbs !== undefined) c.cvdSlopeMinAbs = scale(c.cvdSlopeMinAbs, 0.80);
+      if (c.clusterMinVolume !== undefined) c.clusterMinVolume = Math.max(1, Math.round(c.clusterMinVolume * 0.85));
+    }
+  }
+
   // ===== Bar-close signal =====
   public processNewBar(incoming: BarData, marketState: MarketState): TradeSignal {
     if (!this.isWarmUpProcessed || !this.inSession(incoming.timestamp)) return { signal: 'hold', reason: 'session/warmup', confidence: 0 };
@@ -227,6 +286,12 @@ export class MNQDeltaTrendCalculator {
     const trend = this.determineTrend();
     marketState.atr = Number.isFinite(atr) ? atr : 0;
     marketState.higherTimeframeTrend = trend;
+
+    // Regime update: ATR + simple CVD-slope proxy from delta change
+    const currDelta = Number(bar.delta ?? 0);
+    const prevDelta = this.bars3min.length >= 2 ? Number(this.bars3min[this.bars3min.length - 2].delta ?? 0) : 0;
+    const cvdSlope = Math.abs(currDelta - prevDelta);
+    this.updateRegime(atr, cvdSlope);
 
     // Exit checks first (bar-close)
     const exit = this.checkExitConditions(bar);
@@ -267,6 +332,8 @@ export class MNQDeltaTrendCalculator {
     if (!this.isWarmUpProcessed) return { signal: 'hold', reason: 'warmup', confidence: 0 };
     if (!this.inSession(formingBar.timestamp)) return { signal: 'hold', reason: 'out of session', confidence: 0 };
     if (this.hasPosition()) return { signal: 'hold', reason: 'already in position', confidence: 0 };
+        // Apply regime-based scaling for this forming bar
+    this.applyRegimeScaling();
 
     const nowMs = Date.now();
     const delta = formingBar.delta ?? 0;

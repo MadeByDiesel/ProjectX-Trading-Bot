@@ -140,23 +140,72 @@ export class SignalRService {
       this.logger.warn('Market Hub connection not available when setting handlers');
       return;
     }
+    let depthSeen = 0; // telemetry only
 
     conn.on('GatewayQuote', (contractId: string, data: GatewayQuote) => {
       if (!this.firstQuoteLogged) {
         this.logger.info(
-          `First GatewayQuote: contractId=${contractId}, symbol=${(data as any).symbol ?? 'N/A'}, lastPrice=${data.lastPrice}`
+          `First GatewayQuote: contractId=${contractId}, symbol=${(data as any).symbol ?? 'N/A'}, lastPrice=${(data as any).lastPrice}`
         );
         this.firstQuoteLogged = true;
       }
-      this.emit('market_data', { contractId, ...data });
-    });
 
+      // --- Normalize lastPrice for downstream consumers (trader/calculator) ---
+      const q: any = data as any;
+      const normalizedLast =
+        (Number.isFinite(q.lastPrice) ? q.lastPrice : undefined) ??
+        (Number.isFinite(q.lastTrade) ? q.lastTrade : undefined) ??
+        (
+          Number.isFinite(q.bestBid) && Number.isFinite(q.bestAsk)
+            ? (q.bestBid + q.bestAsk) / 2
+            : (Number.isFinite(q.bestBid)
+                ? q.bestBid
+                : (Number.isFinite(q.bestAsk) ? q.bestAsk : undefined))
+        );
+
+      if (Number.isFinite(normalizedLast)) {
+        this.emit('market_data', { contractId, ...data, lastPrice: normalizedLast });
+      }
+      // if no valid last price available, skip emitting
+    });
+    
     conn.on('GatewayTrade', (contractId: string, data: GatewayTrade) => {
       this.emit('market_trade', { contractId, ...data });
     });
 
-    conn.on('GatewayDepth', (contractId: string, data: GatewayDepth) => {
-      this.emit('market_depth', { contractId, ...data });
+    conn.on('GatewayDepth', (contractId: string, data: GatewayDepth | GatewayDepth[] | null) => {
+      // const raw: any = data;
+      // this.logger.debug('[Depth][RAW]', { contractId, keys: Array.isArray(raw) ? Object.keys(raw) : Object.keys(raw || {}), raw });
+
+      // Normalize: Topstep may send an array of entries (with nulls). Emit one event per non-null entry.
+      if (Array.isArray(data)) {
+        for (const entry of data) {
+          if (!entry) continue;
+          const { timestamp, type, price, volume, currentVolume } = entry as any;
+          this.emit('market_depth', {
+            contractId,
+            timestamp: timestamp ?? new Date().toISOString(),
+            type,
+            price,
+            volume,
+            currentVolume
+          });
+        }
+        return;
+      }
+
+      // Fallback: single object shape
+      if (data && typeof data === 'object') {
+        const { timestamp, type, price, volume, currentVolume } = data as any;
+        this.emit('market_depth', {
+          contractId,
+          timestamp: timestamp ?? new Date().toISOString(),
+          type,
+          price,
+          volume,
+          currentVolume
+        });
+      }
     });
 
     conn.onreconnected(async () => {
@@ -167,13 +216,13 @@ export class SignalRService {
       try {
         const { projectXClient, trader } = global as any; // both already initialized in server.ts
         if (projectXClient && trader) {
-          const openPositions = await projectXClient.searchOpenPositions();
+          const openPositions = await projectXClient.getPositions();
           const mnq = openPositions.find((p: any) => p.contractId?.includes('MNQ'));
           if (mnq) {
             const side = mnq.side === 1 ? 'short' : 'long';
             const avgPrice = mnq.avgPrice;
-            const currentATR = trader.calculator.calculateATR();
-            trader.calculator.setPosition(avgPrice, side, currentATR);
+            // setPosition computes ATR internally if not provided
+            trader.calculator.setPosition(avgPrice, side);
             this.logger.info('[reconnect] Restored open MNQ position', { side, avgPrice });
           } else {
             this.logger.info('[reconnect] No open MNQ positions to restore');
@@ -200,6 +249,7 @@ export class SignalRService {
       try {
         await conn.invoke('SubscribeContractQuotes', id);
         await conn.invoke('SubscribeContractTrades', id);
+        await conn.invoke('SubscribeContractMarketDepth', id);
         this.subscribedContracts.add(id);
         this.logger.info(`Subscribed to market data for contract: ${id}`);
       } catch (error) {
@@ -222,6 +272,7 @@ export class SignalRService {
     try {
       await conn.invoke('UnsubscribeContractQuotes', contractId);
       await conn.invoke('UnsubscribeContractTrades', contractId);
+      await conn.invoke('UnsubscribeContractMarketDepth', contractId);
       this.subscribedContracts.delete(contractId);
       this.logger.info(`Unsubscribed from market data for contract: ${contractId}`);
     } catch (error) {
@@ -237,6 +288,7 @@ export class SignalRService {
       try {
         await conn.invoke('SubscribeContractQuotes', id);
         await conn.invoke('SubscribeContractTrades', id);
+        await conn.invoke('SubscribeContractMarketDepth', id);
         this.logger.info(`Re-subscribed contract after reconnect: ${id}`);
       } catch (err) {
         this.logger.error(`Failed to re-subscribe contract ${id} after reconnect`, err);

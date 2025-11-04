@@ -1,13 +1,14 @@
 import { ProjectXClient } from '../../services/projectx-client';
 import { MNQDeltaTrendCalculator } from './calculator';
 import { StrategyConfig } from './types';
-import { GatewayQuote, BarData } from '../../types';
+import { GatewayQuote, GatewayDepth, BarData, DomType } from '../../types';
 import { execFile, ExecFileException, ExecFileOptionsWithStringEncoding } from 'child_process';
 
 export class MNQDeltaTrendTrader {
   private client: ProjectXClient;
   private calculator: MNQDeltaTrendCalculator;
   private config: StrategyConfig;
+  private depthLogOnce = false;
 
   private contractId: string;
   private symbol: string;
@@ -180,6 +181,7 @@ private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
     await this.client.connectWebSocket();
     await this.client.getSignalRService().subscribeToMarketData(this.contractId);
     this.client.onMarketData(this.marketDataHandler);
+    this.client.onDepth(this.onDepth.bind(this));
 
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = setInterval(() => {
@@ -351,6 +353,41 @@ private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
     }
   }
 
+  private onDepth(d: { contractId: string; timestamp: string; type: number; price: number; volume: number; currentVolume: number }): void {
+    // console.info('[MNQDeltaTrend][Depth][RAW]', { contractId: d.contractId, keys: Object.keys(d as any), raw: d });
+    console.debug('[MNQDeltaTrend][Depth->Trader]', { id: d.contractId, type: d.type, price: d.price, vol: (d as any).currentVolume ?? d.volume });
+
+    if (!this.depthLogOnce) {
+      console.info(`[MNQDeltaTrend][Depth:first] ${d.contractId} px=${d.price} vol=${d.volume ?? d.currentVolume} type=${d.type}`);
+      this.depthLogOnce = true;
+    }
+    if (!this.running) return;
+    if (d.contractId !== this.contractId) return;
+
+    // Accept enum or raw numeric types coming from the hub.
+    // 3 = BestAsk/NewBestAsk, 4 = BestBid/NewBestBid (per observed logs)
+    // Anything else (e.g., 5) is ignored for cluster accumulation.
+    const isAsk = d.type === DomType.Ask || d.type === DomType.BestAsk || d.type === DomType.NewBestAsk || d.type === 3;
+    const isBid = d.type === DomType.Bid || d.type === DomType.BestBid || d.type === DomType.NewBestBid || d.type === 4;
+    if (!isAsk && !isBid) return; // ignore type 5 and unknowns
+
+    // after the isAsk/isBid mapping and the `if (!isAsk && !isBid) return;`
+    const inc = (typeof d.currentVolume === 'number' && d.currentVolume > 0)
+      ? d.currentVolume
+      : (typeof d.volume === 'number' && d.volume > 0 ? d.volume : 0);
+    if (inc <= 0) return;
+
+    const TICK = 0.25;
+    const key = Math.round(d.price / TICK) * TICK;
+
+    const node = this.clusterByPrice.get(key) ?? { buy: 0, sell: 0, lastTs: 0 };
+    if (isAsk) node.buy += inc;
+    else if (isBid) node.sell += inc;
+    node.lastTs = Date.now();
+
+    this.clusterByPrice.set(key, node);
+  }
+
   private maybeCloseBarByClock(): void {
     if (!this.running) return;
     if (this.barStartMs === null) return;
@@ -447,20 +484,7 @@ private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
       // Forming-bar ATR gate (Pine-accurate)
       let atr = this.marketState.atr ?? 0;
       try { atr = this.calculator.atrWithForming(bar); } catch {}
-      // --- Order-Flow Gates (CVD + Cluster) ---
-      if ((this.config as any).useCvdSlopeGate === true) {
-        if (!this.cvdSlopePass(direction)) {
-          console.debug('[Gate][CVD] blocked', { dir: direction, len: (this.config as any).cvdSlopeLen, minAbs: (this.config as any).cvdSlopeMinAbs });
-          this.enteredBarStartMs = null; this.isEnteringPosition = false; return;
-        }
-      }
 
-      if ((this.config as any).useClusterGuard === true) {
-        if (!this.clusterGuardPass(direction, bar.close)) {
-          console.debug('[Gate][Cluster] blocked', { dir: direction, px: bar.close });
-          this.enteredBarStartMs = null; this.isEnteringPosition = false; return;
-        }
-      }
       const minAtr = Math.max(0, this.config.minAtrToTrade ?? 0);
       if (!Number.isFinite(atr) || atr < minAtr) {
         this.enteredBarStartMs = null;
@@ -468,22 +492,22 @@ private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
         return;
       }
 
-      // ---- NEW: CVD slope gate (optional) ----
-      if ((this.config as any).useCvdSlopeGate === true) {
-        if (!this.cvdSlopePass(direction)) {
-          this.enteredBarStartMs = null;
-          this.isEnteringPosition = false;
-          return;
-        }
+      // --- Order-Flow Gates (single pass) ---
+      if ((this.config as any).useCvdSlopeGate === true && !this.cvdSlopePass(direction)) {
+        console.debug('[Gate][CVD] blocked@intra', {
+          dir: direction,
+          len: (this.config as any).cvdSlopeLen,
+          minAbs: (this.config as any).cvdSlopeMinAbs
+        });
+        this.enteredBarStartMs = null;
+        this.isEnteringPosition = false;
+        return;
       }
-
-      // ---- NEW: Order-flow cluster guard (optional) ----
-      if ((this.config as any).useClusterGuard === true) {
-        if (!this.clusterGuardPass(direction, bar.close)) {
-          this.enteredBarStartMs = null;
-          this.isEnteringPosition = false;
-          return;
-        }
+      if ((this.config as any).useClusterGuard === true && !this.clusterGuardPass(direction, bar.close)) {
+        console.debug('[Gate][Cluster] blocked@intra', { dir: direction, px: bar.close });
+        this.enteredBarStartMs = null;
+        this.isEnteringPosition = false;
+        return;
       }
 
       const qty = Math.max(1, this.config.contractQuantity ?? 1);

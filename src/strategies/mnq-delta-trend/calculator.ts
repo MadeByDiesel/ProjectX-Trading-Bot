@@ -39,6 +39,9 @@ export class MNQDeltaTrendCalculator {
     current: 'Normal' as 'Chop' | 'Normal' | 'Trend',
     atrSamples: [] as number[],
     cvdSlopeSamples: [] as number[],
+    pending: 0,
+    rmaAtr: 0,
+    rmaCvd: 0,
   };
 
   private baseConfig!: Readonly<StrategyConfig>;
@@ -218,9 +221,16 @@ export class MNQDeltaTrendCalculator {
     if (s.atrSamples.length > 20) s.atrSamples.shift();
     if (s.cvdSlopeSamples.length > 20) s.cvdSlopeSamples.shift();
 
-    const mean = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / Math.max(1, arr.length);
-    const atrMean = s.atrSamples.length ? mean(s.atrSamples) : Number(atrValue || 0);
-    const cvdMean = s.cvdSlopeSamples.length ? mean(s.cvdSlopeSamples) : Math.abs(cvdSlope);
+    // AFTER  ✅ smooth running means
+    const len = 14;
+    const rma = (prev: number, curr: number, l: number) => prev + (curr - prev) * (2 / (l + 1));
+
+    s.rmaAtr = rma(s.rmaAtr ?? atrValue, atrValue, len);
+    s.rmaCvd = rma(s.rmaCvd ?? Math.abs(cvdSlope), Math.abs(cvdSlope), len);
+
+    const atrMean = s.rmaAtr;
+    const cvdMean = s.rmaCvd;
+
     const cvdStd = Math.sqrt(
       s.cvdSlopeSamples.map(v => (v - cvdMean) ** 2).reduce((a, b) => a + b, 0) / Math.max(1, s.cvdSlopeSamples.length)
     );
@@ -229,11 +239,18 @@ export class MNQDeltaTrendCalculator {
     if (Number.isFinite(atrValue) && atrValue < atrMean * 0.8 && cvdStd < cvdMean * 0.8) next = 'Chop';
     else if ((Number.isFinite(atrValue) && atrValue > atrMean * 1.2) || cvdStd > cvdMean * 1.2) next = 'Trend';
 
+    // AFTER  ✅ hysteresis: need 3 consecutive confirmations
     if (next !== s.current) {
-      if (Number.isFinite(atrValue)) {
-        console.info(`[Regime] ${s.current}→${next} | ATR=${Number(atrValue).toFixed(2)} | dCVDσ=${cvdStd.toFixed(0)}`);
+      s.pending = (s.pending ?? 0) + 1;
+      if (s.pending >= 3) {
+        if (Number.isFinite(atrValue)) {
+          console.info(`[Regime] ${s.current}→${next} | ATR=${Number(atrValue).toFixed(2)} | dCVDσ=${cvdStd.toFixed(0)}`);
+        }
+        s.current = next;
+        s.pending = 0;
       }
-      s.current = next;
+    } else {
+      s.pending = 0;
     }
   }
 
@@ -338,7 +355,13 @@ export class MNQDeltaTrendCalculator {
     if (!this.isWarmUpProcessed) return { signal: 'hold', reason: 'warmup', confidence: 0 };
     if (!this.inSession(formingBar.timestamp)) return { signal: 'hold', reason: 'out of session', confidence: 0 };
     if (this.hasPosition()) return { signal: 'hold', reason: 'already in position', confidence: 0 };
-        // Apply regime-based scaling for this forming bar
+
+    // AFTER  ✅ fresh regime before scaling
+    const atrNow = this.atrWithForming(formingBar);
+    const prevDelta = this.bars3min.length >= 2 ? this.bars3min[this.bars3min.length - 2].delta ?? 0 : 0;
+    const cvdSlope = Math.abs((formingBar.delta ?? 0) - prevDelta);
+
+    this.updateRegime(atrNow, cvdSlope);
     this.applyRegimeScaling();
 
     const nowMs = Date.now();

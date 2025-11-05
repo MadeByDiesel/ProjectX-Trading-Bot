@@ -282,6 +282,8 @@ export class MNQDeltaTrendCalculator {
 
     this.updateHigherTimeframeBars(bar);
 
+    this.applyRegimeScaling();
+
     const atr = this.calculateATR();
     const trend = this.determineTrend();
     marketState.atr = Number.isFinite(atr) ? atr : 0;

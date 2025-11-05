@@ -230,7 +230,9 @@ export class MNQDeltaTrendCalculator {
     else if ((Number.isFinite(atrValue) && atrValue > atrMean * 1.2) || cvdStd > cvdMean * 1.2) next = 'Trend';
 
     if (next !== s.current) {
-      console.info(`[Regime] ${s.current}→${next} | ATR=${Number(atrValue).toFixed(2)} | dCVDσ=${cvdStd.toFixed(0)}`);
+      if (Number.isFinite(atrValue)) {
+        console.info(`[Regime] ${s.current}→${next} | ATR=${Number(atrValue).toFixed(2)} | dCVDσ=${cvdStd.toFixed(0)}`);
+      }
       s.current = next;
     }
   }
@@ -282,18 +284,20 @@ export class MNQDeltaTrendCalculator {
 
     this.updateHigherTimeframeBars(bar);
 
-    this.applyRegimeScaling();
-
     const atr = this.calculateATR();
     const trend = this.determineTrend();
     marketState.atr = Number.isFinite(atr) ? atr : 0;
     marketState.higherTimeframeTrend = trend;
 
-    // Regime update: ATR + simple CVD-slope proxy from delta change
-    const currDelta = Number(bar.delta ?? 0);
-    const prevDelta = this.bars3min.length >= 2 ? Number(this.bars3min[this.bars3min.length - 2].delta ?? 0) : 0;
-    const cvdSlope = Math.abs(currDelta - prevDelta);
-    this.updateRegime(atr, cvdSlope);
+    // Regime update only when ATR is valid
+    if (Number.isFinite(atr)) {
+      const currDelta = Number(bar.delta ?? 0);
+      const prevDelta = this.bars3min.length >= 2 ? Number(this.bars3min[this.bars3min.length - 2].delta ?? 0) : 0;
+      const cvdSlope = Math.abs(currDelta - prevDelta);
+
+      this.updateRegime(atr, cvdSlope);
+      this.applyRegimeScaling(); // <-- now scales using current regime
+    }
 
     // Exit checks first (bar-close)
     const exit = this.checkExitConditions(bar);

@@ -213,46 +213,69 @@ export class MNQDeltaTrendCalculator {
     return sum / n;
   }
 
-   private updateRegime(atrValue: number, cvdSlope: number): void {
-    const s = this.regimeState;
+  // Bar-scoped hysteresis: require 3 consecutive **bars** voting for a change
+  private updateRegime(atrValue: number, cvdSlope: number, tsISO: string): void {
+    const s = this.regimeState as any;
 
     if (Number.isFinite(atrValue)) s.atrSamples.push(atrValue);
     s.cvdSlopeSamples.push(Math.abs(cvdSlope));
     if (s.atrSamples.length > 20) s.atrSamples.shift();
     if (s.cvdSlopeSamples.length > 20) s.cvdSlopeSamples.shift();
 
-    // AFTER  ✅ smooth running means
+    // RMA smoothing
     const len = 14;
     const rma = (prev: number, curr: number, l: number) => prev + (curr - prev) * (2 / (l + 1));
-
     s.rmaAtr = rma(s.rmaAtr ?? atrValue, atrValue, len);
     s.rmaCvd = rma(s.rmaCvd ?? Math.abs(cvdSlope), Math.abs(cvdSlope), len);
 
     const atrMean = s.rmaAtr;
     const cvdMean = s.rmaCvd;
-
     const cvdStd = Math.sqrt(
-      s.cvdSlopeSamples.map(v => (v - cvdMean) ** 2).reduce((a, b) => a + b, 0) / Math.max(1, s.cvdSlopeSamples.length)
+      s.cvdSlopeSamples.map((v: number) => (v - cvdMean) ** 2).reduce((a: number, b: number) => a + b, 0) /
+      Math.max(1, s.cvdSlopeSamples.length)
     );
 
     let next: 'Chop' | 'Normal' | 'Trend' = 'Normal';
     if (Number.isFinite(atrValue) && atrValue < atrMean * 0.8 && cvdStd < cvdMean * 0.8) next = 'Chop';
     else if ((Number.isFinite(atrValue) && atrValue > atrMean * 1.2) || cvdStd > cvdMean * 1.2) next = 'Trend';
 
-    // AFTER  ✅ hysteresis: need 3 consecutive confirmations
-    if (next !== s.current) {
-      s.pending = (s.pending ?? 0) + 1;
-      if (s.pending >= 3) {
-        if (Number.isFinite(atrValue)) {
-          console.info(`[Regime] ${s.current}→${next} | ATR=${Number(atrValue).toFixed(2)} | dCVDσ=${cvdStd.toFixed(0)}`);
-        }
-        s.current = next;
-        s.pending = 0;
-      }
-    } else {
-      s.pending = 0;
+    // --- BAR-SCOPED HYSTERESIS (increment across bars; no intrabar votes) ---
+    const stepMs = 3 * 60 * 1000;
+    const bucket = Math.floor(Date.parse(tsISO) / stepMs) * stepMs;
+
+    s._voteBucket = s._voteBucket ?? null;
+    s._voteCount  = s._voteCount  ?? 0;
+    s._voteTarget = s._voteTarget ?? null;
+
+    if (next === s.current) {
+      // aligned with current → clear any pending flip
+      s._voteBucket = null;
+      s._voteCount  = 0;
+      s._voteTarget = null;
+      return;
     }
-  }
+
+    if (s._voteTarget !== next) {
+      // new target → start voting on this bar
+      s._voteTarget = next;
+      s._voteBucket = bucket;
+      s._voteCount  = 1;
+    } else {
+      // same target: count only once per **new** bar
+      if (s._voteBucket === null || bucket > s._voteBucket) {
+        s._voteBucket = bucket;
+        s._voteCount += 1;
+      }
+    }
+
+    if (s._voteCount >= 3) {
+      console.info(`[Regime] ${s.current}→${next} | ATR=${Number(atrValue).toFixed(2)} | dCVDσ=${cvdStd.toFixed(0)}`);
+      s.current    = next;
+      s._voteBucket = null;
+      s._voteCount  = 0;
+      s._voteTarget = null;
+    }
+  } // <-- close updateRegime
 
   private applyRegimeScaling(): void {
     // reset to baseline first
@@ -307,13 +330,22 @@ export class MNQDeltaTrendCalculator {
     marketState.higherTimeframeTrend = trend;
 
     // Regime update only when ATR is valid
+    // AFTER (insert the console.debug line right after applyRegimeScaling)
     if (Number.isFinite(atr)) {
       const currDelta = Number(bar.delta ?? 0);
       const prevDelta = this.bars3min.length >= 2 ? Number(this.bars3min[this.bars3min.length - 2].delta ?? 0) : 0;
       const cvdSlope = Math.abs(currDelta - prevDelta);
 
-      this.updateRegime(atr, cvdSlope);
-      this.applyRegimeScaling(); // <-- now scales using current regime
+      this.updateRegime(atr, cvdSlope, bar.timestamp);
+      this.applyRegimeScaling();
+
+      // Effective-thresholds (bar-close) for audit parity
+      console.debug(
+        `[Regime][Effective][Close] spike=${this.config.deltaSpikeThreshold} ` +
+        `minATR=${this.config.minAtrToTrade} ` +
+        `trailAct=${this.config.trailActivationATR} trailOff=${this.config.trailOffsetATR} ` +
+        `cvdMin=${(this.config as any).cvdSlopeMinAbs} clusterMin=${(this.config as any).clusterMinVolume}`
+      );
     }
 
     // Exit checks first (bar-close)
@@ -361,8 +393,16 @@ export class MNQDeltaTrendCalculator {
     const prevDelta = this.bars3min.length >= 2 ? this.bars3min[this.bars3min.length - 2].delta ?? 0 : 0;
     const cvdSlope = Math.abs((formingBar.delta ?? 0) - prevDelta);
 
-    this.updateRegime(atrNow, cvdSlope);
+    this.updateRegime(atrNow, cvdSlope, formingBar.timestamp);
     this.applyRegimeScaling();
+
+    // Effective-thresholds (intrabar) for audit parity
+    console.debug(
+      `[Regime][Effective][Intra] spike=${this.config.deltaSpikeThreshold} ` +
+      `minATR=${this.config.minAtrToTrade} ` +
+      `trailAct=${this.config.trailActivationATR} trailOff=${this.config.trailOffsetATR} ` +
+      `cvdMin=${(this.config as any).cvdSlopeMinAbs} clusterMin=${(this.config as any).clusterMinVolume}`
+    );
 
     const nowMs = Date.now();
     const delta = formingBar.delta ?? 0;

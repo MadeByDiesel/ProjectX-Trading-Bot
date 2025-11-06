@@ -318,12 +318,13 @@ export class MNQDeltaTrendCalculator {
       if (c.cvdSlopeMinAbs !== undefined) c.cvdSlopeMinAbs = scale(c.cvdSlopeMinAbs, 1.50);
       if (c.clusterMinVolume !== undefined) c.clusterMinVolume = Math.round(c.clusterMinVolume * 1.30);
     } else if (r === 'Trend') {
-      c.deltaSpikeThreshold = scale(c.deltaSpikeThreshold, 0.85);
-      c.minAtrToTrade      = scale(c.minAtrToTrade,      0.80);
-      c.trailActivationATR = scale(c.trailActivationATR, 0.75);
-      c.trailOffsetATR     = scale(c.trailOffsetATR,     0.75);
-      if (c.cvdSlopeMinAbs !== undefined) c.cvdSlopeMinAbs = scale(c.cvdSlopeMinAbs, 0.80);
-      if (c.clusterMinVolume !== undefined) c.clusterMinVolume = Math.max(1, Math.round(c.clusterMinVolume * 0.85));
+      // Ease entries a bit, but DO NOT widen trailing in trend.
+      c.deltaSpikeThreshold = scale(c.deltaSpikeThreshold, 0.90);  // 10% easier
+      c.minAtrToTrade      = scale(c.minAtrToTrade,      0.90);    // 10% easier
+      c.trailActivationATR = scale(c.trailActivationATR, 1.00);    // unchanged vs baseline
+      c.trailOffsetATR     = scale(c.trailOffsetATR,     1.00);    // unchanged vs baseline
+      if (c.cvdSlopeMinAbs !== undefined) c.cvdSlopeMinAbs = scale(c.cvdSlopeMinAbs, 0.90);
+      if (c.clusterMinVolume !== undefined) c.clusterMinVolume = Math.max(1, Math.round(c.clusterMinVolume * 0.95));
     }
   }
 
@@ -558,8 +559,11 @@ export class MNQDeltaTrendCalculator {
     const atrAtEntry = Number.isFinite(caller) ? caller : Number.isFinite(stash) ? stash : computed;
     if (!Number.isFinite(atrAtEntry) || atrAtEntry <= 0) return;
 
-    // ATR cap at entry (configurable)
-    const ATR_CAP = (this.config as any).atrCap ?? 24;
+    // ATR cap at entry (configurable) — disable in Trend to avoid throttling momentum legs
+    let ATR_CAP = (this.config as any).atrCap ?? 24;
+    if (this.regimeState.current === 'Trend') {
+      ATR_CAP = Number.POSITIVE_INFINITY;
+    }
     const baseSlMult = Number(this.config.atrStopLossMultiplier ?? 0.20);
     const offMult = Number(this.config.trailOffsetATR ?? 0.125);
     const actMult = Math.max(0, Number(this.config.trailActivationATR ?? 0.30));
@@ -610,10 +614,12 @@ export class MNQDeltaTrendCalculator {
     const seed = this.fixedTrail.entryATR;
     const atrLive = Number.isFinite(_atrNow) && _atrNow > 0 ? _atrNow : (this.calculateATR() || seed);
 
-    // Optional live compression to avoid runaway ATR-inflation trails
+    // Optional live compression — keep geometry baseline on Trend (no shrink)
     let shrink = 1.0;
-    if (Number.isFinite(atrLive) && atrLive > seed * 1.3) {
-      shrink = Math.max(seed / atrLive, 0.5);
+    if (this.regimeState.current !== 'Trend') {
+      if (Number.isFinite(atrLive) && atrLive > seed * 1.3) {
+        shrink = Math.max(seed / atrLive, 0.5);
+      }
     }
 
     const offPts = this.fixedTrail.offPts * shrink;

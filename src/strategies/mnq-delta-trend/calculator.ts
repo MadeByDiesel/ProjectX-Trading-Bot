@@ -29,9 +29,6 @@ export class MNQDeltaTrendCalculator {
   private firstDeltaMsInBar = 0;
   private lastIntraBarSignalTime = 0;
 
-  // Bar-close gating
-  private lastEntryBarTimestamp: string | null = null;
-
   // Stash ATR at signal time for parity fallback
   private lastAtrAtSignal: number | null = null;
 
@@ -44,6 +41,7 @@ export class MNQDeltaTrendCalculator {
     rmaCvd: 0,
   };
 
+  private lockedRegime: 'Chop' | 'Normal' | 'Trend' | null = null;
   private _regimeLog = { lastBucket: 0, lastHash: '', lastTs: 0 };
 
   private baseConfig!: Readonly<StrategyConfig>;
@@ -306,7 +304,8 @@ export class MNQDeltaTrendCalculator {
     // reset to baseline first
     Object.assign(this.config, this.baseConfig);
 
-    const r = this.regimeState.current;
+    // use locked regime while in a position to keep thresholds constant
+    const r = (this.lockedRegime ?? this.regimeState.current);
     const c = this.config as any;
     const scale = (v: number, m: number) => Number((v * m).toFixed(4));
 
@@ -422,12 +421,10 @@ export class MNQDeltaTrendCalculator {
     const passDeltaShort = d < -spike && d < deltaSMA * -mult;
 
     if (passDeltaLong && passLong && brokeUpCloseTol && trend === 'bullish') {
-      this.lastEntryBarTimestamp = bar.timestamp;
       this.lastAtrAtSignal = atr;
       return { signal: 'buy', reason: `Δ=${d} > SMA×mult=${(deltaSMA * mult).toFixed(0)}`, confidence: 0.9 };
     }
     if (passDeltaShort && passShort && brokeDownCloseTol && trend === 'bearish') {
-      this.lastEntryBarTimestamp = bar.timestamp;
       this.lastAtrAtSignal = atr;
       return { signal: 'sell', reason: `Δ=${d} < SMA×mult=${(deltaSMA * -mult).toFixed(0)}`, confidence: 0.9 };
     }
@@ -501,14 +498,12 @@ export class MNQDeltaTrendCalculator {
 
     if (passDeltaLong && passLong && brokeUp && trend === 'bullish') {
       this.lastIntraBarSignalTime = nowMs;
-      this.lastEntryBarTimestamp = formingBar.timestamp;
       this.lastAtrAtSignal = atr;
       return { signal: 'buy', reason: `[INTRA] Δ=${delta} > ${longThr.toFixed(0)} (${this.intraBarDeltaHistory.length} conf)`, confidence: 0.85 };
     }
 
     if (passDeltaShort && passShort && brokeDown && trend === 'bearish') {
       this.lastIntraBarSignalTime = nowMs;
-      this.lastEntryBarTimestamp = formingBar.timestamp;
       this.lastAtrAtSignal = atr;
       return { signal: 'sell', reason: `[INTRA] Δ=${delta} < ${shortThr.toFixed(0)} (${this.intraBarDeltaHistory.length} conf)`, confidence: 0.85 };
     }
@@ -546,7 +541,6 @@ export class MNQDeltaTrendCalculator {
 
   public clearCooldowns(): void {
     this.lastIntraBarSignalTime = 0;
-    this.lastEntryBarTimestamp = null;
   }
 
   // ===== Position / Trail =====
@@ -579,6 +573,7 @@ export class MNQDeltaTrendCalculator {
 
     this.currentPosition = { entryPrice, entryTime: Date.now(), direction, stopLoss: stop };
     this.trailingStopLevel = stop;
+    this.lockedRegime = this.regimeState.current;
   }
 
   public clearPosition(): void {
@@ -586,8 +581,8 @@ export class MNQDeltaTrendCalculator {
     this.trailingStopLevel = 0;
     this.fixedTrail = null;
     this.lastAtrAtSignal = null;
-    this.lastEntryBarTimestamp = null;
     this.lastIntraBarSignalTime = 0;
+    this.lockedRegime = null;
   }
 
   public onTickForProtectiveStops(lastPrice: number, _atrNow: number): 'none' | 'hitStop' | 'hitTrail' {

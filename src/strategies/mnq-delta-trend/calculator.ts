@@ -543,16 +543,22 @@ export class MNQDeltaTrendCalculator {
     if (!this.currentPosition || !Number.isFinite(lastPrice)) return 'none';
     if (!this.fixedTrail) return 'none';
 
-    // Honor minBarsBeforeExit before trailing engages
+    const px = snapToTick(lastPrice);
+    const { direction: dir, entryPrice } = this.currentPosition;
+    const stop = this.currentPosition.stopLoss;
+
+    // always enforce the hard stop immediately
+    if ((dir === 'long' && px <= stop) || (dir === 'short' && px >= stop)) {
+      return 'hitStop';
+    }
+
+    // only block trailing until minBars satisfied
     const minBars = Math.max(0, this.config.minBarsBeforeExit ?? 0);
     if (minBars > 0) {
       const { entryTime } = this.currentPosition;
       const barsSinceEntry = this.bars3min.filter(b => new Date(b.timestamp).getTime() > entryTime).length;
       if (barsSinceEntry < minBars) return 'none';
-    }
-
-    const px = snapToTick(lastPrice);
-    const { direction: dir, entryPrice } = this.currentPosition;
+    }   
 
     const seed = this.fixedTrail.entryATR;
     const atrLive = Number.isFinite(_atrNow) && _atrNow > 0 ? _atrNow : (this.calculateATR() || seed);
@@ -573,7 +579,7 @@ export class MNQDeltaTrendCalculator {
     if (!reachedActivation) {
       // keep stops snapped
       this.trailingStopLevel = snapStop(this.trailingStopLevel, dir);
-      this.currentPosition.stopLoss = this.trailingStopLevel;
+      // this.currentPosition.stopLoss = this.trailingStopLevel;
 
       if ((dir === 'long' && px <= this.trailingStopLevel) ||
           (dir === 'short' && px >= this.trailingStopLevel)) {
@@ -585,12 +591,12 @@ export class MNQDeltaTrendCalculator {
     if (dir === 'long') {
       const candidate = snapStop(px - offPts, 'long');
       if (candidate > this.trailingStopLevel) this.trailingStopLevel = candidate;
-      this.currentPosition.stopLoss = this.trailingStopLevel;
+      // this.currentPosition.stopLoss = this.trailingStopLevel;
       if (px <= this.trailingStopLevel) return 'hitTrail';
     } else {
       const candidate = snapStop(px + offPts, 'short');
       if (candidate < this.trailingStopLevel) this.trailingStopLevel = candidate;
-      this.currentPosition.stopLoss = this.trailingStopLevel;
+      // this.currentPosition.stopLoss = this.trailingStopLevel;
       if (px >= this.trailingStopLevel) return 'hitTrail';
     }
     return 'none';

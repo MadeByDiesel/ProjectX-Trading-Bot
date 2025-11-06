@@ -48,6 +48,14 @@ export class MNQDeltaTrendCalculator {
 
   private baseConfig!: Readonly<StrategyConfig>;
 
+  private breakoutTolFromATR(atr: number): number {
+    const min = 4 * TICK_SIZE;      // floor = 4 ticks (1.00 pt on MNQ)
+    const max = 12 * TICK_SIZE;     // cap   = 12 ticks (3.00 pts)
+    const atrFrac = 0.05;           // 5% of ATR(14) on 3-min
+    const t = Math.max(min, atr * atrFrac);
+    return Math.min(t, max);
+  }
+
   constructor(config: StrategyConfig) {
     this.config = config;
     this.technical = new TechnicalCalculator();
@@ -161,12 +169,21 @@ export class MNQDeltaTrendCalculator {
   private checkBreakoutIntrabar(formingBar: BarData) {
     const n = Math.max(1, this.config.breakoutLookbackBars ?? 20);
     if (this.bars3min.length < n) return { brokeUp: false, brokeDown: false };
+
     const window = this.bars3min.slice(-n);
     const rangeHigh = Math.max(...window.map(b => b.high));
-    const rangeLow = Math.min(...window.map(b => b.low));
-    return { brokeUp: formingBar.high > rangeHigh, brokeDown: formingBar.low < rangeLow };
-  }
+    const rangeLow  = Math.min(...window.map(b => b.low));
 
+    const atr = this.atrWithForming(formingBar);
+    const tol = Number.isFinite(atr) ? this.breakoutTolFromATR(atr) : 4 * TICK_SIZE;
+
+    return {
+      // “touch or slight poke” within tol, volatility-scaled
+      brokeUp:   formingBar.high >= rangeHigh - tol,
+      brokeDown: formingBar.low  <= rangeLow  + tol,
+    };
+  }
+  
   private checkBreakoutCloseTol() {
     const n = Math.max(1, this.config.breakoutLookbackBars ?? 20);
     if (this.bars3min.length < n) return { brokeUpCloseTol: false, brokeDownCloseTol: false };
@@ -174,9 +191,15 @@ export class MNQDeltaTrendCalculator {
     const window = this.bars3min.slice(-n);
     const last = window[window.length - 1];
     const rangeHigh = Math.max(...window.map(b => b.high));
-    const rangeLow = Math.min(...window.map(b => b.low));
+    const rangeLow  = Math.min(...window.map(b => b.low));
 
-    return { brokeUpCloseTol: last.close > rangeHigh * 0.995, brokeDownCloseTol: last.close < rangeLow * 1.005 };
+    const atr = this.calculateATR();
+    const tol = Number.isFinite(atr) ? this.breakoutTolFromATR(atr) : 4 * TICK_SIZE;
+
+    return {
+      brokeUpCloseTol:   last.close >= rangeHigh - tol,
+      brokeDownCloseTol: last.close <= rangeLow  + tol,
+    };
   }
 
   // ===== EMA filter (LTF) =====

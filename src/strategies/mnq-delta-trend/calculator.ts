@@ -44,6 +44,8 @@ export class MNQDeltaTrendCalculator {
     rmaCvd: 0,
   };
 
+  private _regimeLog = { lastBucket: 0, lastHash: '', lastTs: 0 };
+
   private baseConfig!: Readonly<StrategyConfig>;
 
   constructor(config: StrategyConfig) {
@@ -302,6 +304,39 @@ export class MNQDeltaTrendCalculator {
     }
   }
 
+  private hashEffective(): string {
+    const c: any = this.config;
+    return [
+      c.deltaSpikeThreshold,
+      c.minAtrToTrade,
+      c.trailActivationATR,
+      c.trailOffsetATR,
+      c.cvdSlopeMinAbs,
+      c.clusterMinVolume
+    ].join('|');
+  }
+
+  private maybeLogRegime(kind: 'Intra' | 'Close', tsISO: string): void {
+    const now = Date.now();
+    if (now - this._regimeLog.lastTs < 200) return;
+
+    const bucket = Math.floor(Date.parse(tsISO) / (3 * 60 * 1000)) * (3 * 60 * 1000);
+    const hash = this.hashEffective();
+
+    if (bucket !== this._regimeLog.lastBucket || hash !== this._regimeLog.lastHash) {
+      const c: any = this.config;
+      console.debug(
+        `[Regime][Effective][${kind}] spike=${c.deltaSpikeThreshold} ` +
+        `minATR=${c.minAtrToTrade} trailAct=${c.trailActivationATR} ` +
+        `trailOff=${c.trailOffsetATR} cvdMin=${c.cvdSlopeMinAbs} clusterMin=${c.clusterMinVolume}`
+      );
+      this._regimeLog.lastBucket = bucket;
+      this._regimeLog.lastHash = hash;
+      this._regimeLog.lastTs = now;
+    }
+  }
+  
+
   // ===== Bar-close signal =====
   public processNewBar(incoming: BarData, marketState: MarketState): TradeSignal {
     if (!this.isWarmUpProcessed || !this.inSession(incoming.timestamp)) return { signal: 'hold', reason: 'session/warmup', confidence: 0 };
@@ -339,13 +374,7 @@ export class MNQDeltaTrendCalculator {
       this.updateRegime(atr, cvdSlope, bar.timestamp);
       this.applyRegimeScaling();
 
-      // Effective-thresholds (bar-close) for audit parity
-      console.debug(
-        `[Regime][Effective][Close] spike=${this.config.deltaSpikeThreshold} ` +
-        `minATR=${this.config.minAtrToTrade} ` +
-        `trailAct=${this.config.trailActivationATR} trailOff=${this.config.trailOffsetATR} ` +
-        `cvdMin=${(this.config as any).cvdSlopeMinAbs} clusterMin=${(this.config as any).clusterMinVolume}`
-      );
+      this.maybeLogRegime('Close', bar.timestamp);
     }
 
     // Exit checks first (bar-close)
@@ -397,12 +426,7 @@ export class MNQDeltaTrendCalculator {
     this.applyRegimeScaling();
 
     // Effective-thresholds (intrabar) for audit parity
-    console.debug(
-      `[Regime][Effective][Intra] spike=${this.config.deltaSpikeThreshold} ` +
-      `minATR=${this.config.minAtrToTrade} ` +
-      `trailAct=${this.config.trailActivationATR} trailOff=${this.config.trailOffsetATR} ` +
-      `cvdMin=${(this.config as any).cvdSlopeMinAbs} clusterMin=${(this.config as any).clusterMinVolume}`
-    );
+    this.maybeLogRegime('Intra', formingBar.timestamp); 
 
     const nowMs = Date.now();
     const delta = formingBar.delta ?? 0;

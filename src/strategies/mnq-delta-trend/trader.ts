@@ -1,13 +1,14 @@
 import { ProjectXClient } from '../../services/projectx-client';
 import { MNQDeltaTrendCalculator } from './calculator';
 import { StrategyConfig } from './types';
-import { GatewayQuote, BarData } from '../../types';
+import { GatewayQuote, GatewayDepth, BarData, DomType } from '../../types';
 import { execFile, ExecFileException, ExecFileOptionsWithStringEncoding } from 'child_process';
 
 export class MNQDeltaTrendTrader {
   private client: ProjectXClient;
   private calculator: MNQDeltaTrendCalculator;
   private config: StrategyConfig;
+  private depthLogOnce = false;
 
   private contractId: string;
   private symbol: string;
@@ -39,6 +40,76 @@ export class MNQDeltaTrendTrader {
   private running = false;
   private heartbeat: NodeJS.Timeout | null = null;
   private isFlattening = false;
+
+  // ---- Passive order-flow diagnostics (Phase 1: no behavioral impact) ----
+  // Running CVD across the session (signed trade volume accumulation)
+  private cvdTotal: number = 0;
+
+  // Per-3m-bar CVD snapshot for slope/visuals (rolled at bar-close)
+  private cvdByBar: Array<{ t: number; cvd: number }> = [];
+
+  // Rolling price cluster for the **current 3m bar** only.
+  // Key = price (tick), Value = { buy: vol, sell: vol, lastTs: epoch_ms }.
+  private clusterByPrice = new Map<number, { buy: number; sell: number; lastTs: number }>();
+
+  // --- CVD / Clustering gates (passive → active when enabled) ---
+
+/** Return true if CVD slope agrees with direction over the last N snapshots. */
+private cvdSlopePass(dir: 'long' | 'short'): boolean {
+  const cfg = this.config as any;
+  if (!Array.isArray(this.cvdByBar) || this.cvdByBar.length < 2) return true;
+
+  const n = Math.max(2, Number(cfg.cvdSlopeLen ?? 3));
+  if (this.cvdByBar.length < n) return true;
+
+  const tail = this.cvdByBar.slice(-n);
+  const start = tail[0]?.cvd ?? 0;
+  const end = tail[tail.length - 1]?.cvd ?? 0;
+  const slope = end - start; // simple delta across window
+
+  const minAbs = Math.max(0, Number(cfg.cvdSlopeMinAbs ?? 0));
+  if (Math.abs(slope) < minAbs) return false;
+
+  return dir === 'long' ? slope > 0 : slope < 0;
+}
+
+/**
+ * Return true if no heavy opposing cluster is "ahead" of price within X ticks.
+ * For longs: block if SELL-dominant cluster ahead; for shorts: BUY-dominant below.
+ */
+private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
+  if (this.clusterByPrice.size === 0 || !Number.isFinite(refPrice)) return true;
+
+  const cfg = this.config as any;
+  const tickSize = 0.25;
+  const aheadTicks = Math.max(1, Number(cfg.clusterAheadTicks ?? 8));
+  const minVol = Math.max(0, Number(cfg.clusterMinVolume ?? 200));
+  const imbThr = Math.min(0.99, Math.max(0, Number(cfg.clusterImbalanceThreshold ?? 0.65)));
+
+  const refKey = Math.round(refPrice / tickSize) * tickSize;
+
+  for (const [price, v] of this.clusterByPrice.entries()) {
+    const tot = (v.buy || 0) + (v.sell || 0);
+    if (tot < minVol) continue;
+
+    const imbalance = tot > 0 ? Math.abs((v.buy - v.sell) / tot) : 0;
+
+    if (dir === 'long') {
+      const ticksAhead = Math.round((price - refKey) / tickSize);
+      const sellDominant = v.sell > v.buy;
+      if (ticksAhead > 0 && ticksAhead <= aheadTicks && sellDominant && imbalance >= imbThr) {
+        return false; // heavy sell wall ahead
+      }
+    } else {
+      const ticksBelow = Math.round((refKey - price) / tickSize);
+      const buyDominant = v.buy > v.sell;
+      if (ticksBelow > 0 && ticksBelow <= aheadTicks && buyDominant && imbalance >= imbThr) {
+        return false; // heavy buy wall below (into us)
+      }
+    }
+  }
+  return true;
+}
 
   // Minimal market state
   private marketState = {
@@ -110,6 +181,7 @@ export class MNQDeltaTrendTrader {
     await this.client.connectWebSocket();
     await this.client.getSignalRService().subscribeToMarketData(this.contractId);
     this.client.onMarketData(this.marketDataHandler);
+    this.client.onDepth(this.onDepth.bind(this));
 
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = setInterval(() => {
@@ -157,8 +229,36 @@ export class MNQDeltaTrendTrader {
       else signed = 0;
     }
 
-    this.volInBarByContract.set(contractId, (this.volInBarByContract.get(contractId) ?? 0) + (Number.isFinite(dVol) ? dVol : 0));
-    this.signedVolInBarByContract.set(contractId, (this.signedVolInBarByContract.get(contractId) ?? 0) + (Number.isFinite(signed) ? signed : 0));
+    // Accumulate raw & signed volume for the current bar (existing behavior)
+    const addVol = Number.isFinite(dVol) ? dVol : 0;
+    const addSigned = Number.isFinite(signed) ? signed : 0;
+
+    this.volInBarByContract.set(contractId, (this.volInBarByContract.get(contractId) ?? 0) + addVol);
+    this.signedVolInBarByContract.set(contractId, (this.signedVolInBarByContract.get(contractId) ?? 0) + addSigned);
+
+    // ---- Passive CVD: running sum of signed volume (session scope) ----
+    this.cvdTotal += addSigned;
+
+    // ---- Passive price clustering (current 3m bar only) ----
+    // Attribute the **executed** delta to the last trade price tick.
+    // If price upticked vs previous trade, treat as buyer-aggressed; downtick → seller-aggressed.
+    if (addVol > 0 && typeof prevPx === 'number') {
+      const TICK = 0.25;
+      const keyPrice = Math.round(px / TICK) * TICK;
+      const node = this.clusterByPrice.get(keyPrice) ?? { buy: 0, sell: 0, lastTs: Date.now() };
+
+      if (px > prevPx) {
+        node.buy += addVol;
+      } else if (px < prevPx) {
+        node.sell += addVol;
+      } else {
+        // same price: apportion by signed delta sign (fallback)
+        if (addSigned > 0) node.buy += addVol;
+        else if (addSigned < 0) node.sell += addVol;
+      }
+      node.lastTs = Date.now();
+      this.clusterByPrice.set(keyPrice, node);
+    }
 
     this.lastPriceByContract.set(contractId, px);
     this.lastCumVolByContract.set(contractId, cumVol);
@@ -210,6 +310,10 @@ export class MNQDeltaTrendTrader {
       // Close prior bar and open new one
       this.closeBarAndProcess();
 
+      // ---- Passive: snapshot CVD at bar boundary (tick path) ----
+      this.cvdByBar.push({ t: this.barStartMs + this.barStepMs - 1, cvd: this.cvdTotal });
+      if (this.cvdByBar.length > 5000) this.cvdByBar.shift();
+
       this.barStartMs = bucketStart;
       this.barOpenPx = px;
       this.barHighPx = px;
@@ -225,6 +329,9 @@ export class MNQDeltaTrendTrader {
       this.liveBarLow = px;
       this.liveBarStartMs = nowMs;
       this.lastIntraBarCheckMs = 0;
+
+      // ---- Passive: reset price clusters for the new 3m bar ----
+      this.clusterByPrice.clear();
 
       console.debug(`[MNQDeltaTrend][barOpen] ${new Date(this.barStartMs).toISOString()} O=${px}`);
       return;
@@ -246,17 +353,57 @@ export class MNQDeltaTrendTrader {
     }
   }
 
+  private onDepth(d: { contractId: string; timestamp: string; type: number; price: number; volume: number; currentVolume: number }): void {
+    // console.info('[MNQDeltaTrend][Depth][RAW]', { contractId: d.contractId, keys: Object.keys(d as any), raw: d });
+    console.debug('[MNQDeltaTrend][Depth->Trader]', { id: d.contractId, type: d.type, price: d.price, vol: (d as any).currentVolume ?? d.volume });
+
+    if (!this.depthLogOnce) {
+      console.info(`[MNQDeltaTrend][Depth:first] ${d.contractId} px=${d.price} vol=${d.volume ?? d.currentVolume} type=${d.type}`);
+      this.depthLogOnce = true;
+    }
+    if (!this.running) return;
+    if (d.contractId !== this.contractId) return;
+
+    // Accept enum or raw numeric types coming from the hub.
+    // 3 = BestAsk/NewBestAsk, 4 = BestBid/NewBestBid (per observed logs)
+    // Anything else (e.g., 5) is ignored for cluster accumulation.
+    const isAsk = d.type === DomType.Ask || d.type === DomType.BestAsk || d.type === DomType.NewBestAsk || d.type === 3;
+    const isBid = d.type === DomType.Bid || d.type === DomType.BestBid || d.type === DomType.NewBestBid || d.type === 4;
+    if (!isAsk && !isBid) return; // ignore type 5 and unknowns
+
+    // after the isAsk/isBid mapping and the `if (!isAsk && !isBid) return;`
+    const inc = (typeof d.currentVolume === 'number' && d.currentVolume > 0)
+      ? d.currentVolume
+      : (typeof d.volume === 'number' && d.volume > 0 ? d.volume : 0);
+    if (inc <= 0) return;
+
+    const TICK = 0.25;
+    const key = Math.round(d.price / TICK) * TICK;
+
+    const node = this.clusterByPrice.get(key) ?? { buy: 0, sell: 0, lastTs: 0 };
+    if (isAsk) node.buy += inc;
+    else if (isBid) node.sell += inc;
+    node.lastTs = Date.now();
+
+    this.clusterByPrice.set(key, node);
+  }
+
   private maybeCloseBarByClock(): void {
     if (!this.running) return;
     if (this.barStartMs === null) return;
 
     const nowMs = Date.now();
     const bucketStart = Math.floor(nowMs / this.barStepMs) * this.barStepMs;
+
     if (bucketStart > this.barStartMs) {
       const lastPx = this.lastPriceByContract.get(this.contractId);
       if (!Number.isFinite(lastPx)) return;
 
       this.closeBarAndProcess();
+
+      // ---- Passive: snapshot CVD at bar boundary (clock path) ----
+      this.cvdByBar.push({ t: this.barStartMs + this.barStepMs - 1, cvd: this.cvdTotal });
+      if (this.cvdByBar.length > 5000) this.cvdByBar.shift();
 
       this.barStartMs = bucketStart;
       this.barOpenPx = lastPx!;
@@ -273,6 +420,9 @@ export class MNQDeltaTrendTrader {
       this.liveBarLow = lastPx!;
       this.liveBarStartMs = nowMs;
       this.lastIntraBarCheckMs = 0;
+
+      // ---- Passive: reset clusters for the new 3m bar ----
+      this.clusterByPrice.clear();
 
       console.debug(`[MNQDeltaTrend][barOpen:HB] ${new Date(this.barStartMs).toISOString()} O=${lastPx}`);
     }
@@ -321,27 +471,40 @@ export class MNQDeltaTrendTrader {
     if (this.calculator.hasPosition()) return;
     if (this.isFlattening) return;
 
-    // Async execution lock
     if (this.isEnteringPosition) return;
-
-    // Per-bar entry limit (race guard)
     if (this.enteredBarStartMs === this.barStartMs) return;
 
     this.isEnteringPosition = true;
-
-    // Pre-mark the bar to block bar-close path; rollback only on failure
     const barGate = this.barStartMs;
     this.enteredBarStartMs = barGate;
 
     try {
       const direction = signal.signal === 'buy' ? 'long' : 'short';
 
-      // Pine-accurate ATR gate using the forming bar snapshot
+      // Forming-bar ATR gate (Pine-accurate)
       let atr = this.marketState.atr ?? 0;
       try { atr = this.calculator.atrWithForming(bar); } catch {}
 
       const minAtr = Math.max(0, this.config.minAtrToTrade ?? 0);
       if (!Number.isFinite(atr) || atr < minAtr) {
+        this.enteredBarStartMs = null;
+        this.isEnteringPosition = false;
+        return;
+      }
+
+      // --- Order-Flow Gates (single pass) ---
+      if ((this.config as any).useCvdSlopeGate === true && !this.cvdSlopePass(direction)) {
+        console.debug('[Gate][CVD] blocked@intra', {
+          dir: direction,
+          len: (this.config as any).cvdSlopeLen,
+          minAbs: (this.config as any).cvdSlopeMinAbs
+        });
+        this.enteredBarStartMs = null;
+        this.isEnteringPosition = false;
+        return;
+      }
+      if ((this.config as any).useClusterGuard === true && !this.clusterGuardPass(direction, bar.close)) {
+        console.debug('[Gate][Cluster] blocked@intra', { dir: direction, px: bar.close });
         this.enteredBarStartMs = null;
         this.isEnteringPosition = false;
         return;
@@ -358,7 +521,9 @@ export class MNQDeltaTrendTrader {
 
       this.calculator.setPosition(bar.close, direction, atr);
 
-      if ((this.config as any).sendWebhook) await this.postWebhook(signal.signal === 'buy' ? 'BUY' : 'SELL', qty);
+      if ((this.config as any).sendWebhook) {
+        await this.postWebhook(signal.signal === 'buy' ? 'BUY' : 'SELL', qty);
+      }
 
     } catch (err) {
       console.error('[MNQDeltaTrend][INTRA-BAR ORDER] execution failed:', err);
@@ -400,6 +565,18 @@ export class MNQDeltaTrendTrader {
 
     console.debug(`[MNQDeltaTrend][barClose] t=${closedBar.timestamp} O:${closedBar.open} H:${closedBar.high} L:${closedBar.low} C:${closedBar.close} Δ:${closedBar.delta} V:${closedBar.volume}`);
 
+        // Passive one-liner to observe order-flow health; minimal noise
+    try {
+      const diag = this.getOrderFlowSnapshot();
+      if (diag.topClusters.length) {
+        const head = diag.topClusters[0];
+        console.debug(
+          `[OF] CVD=${diag.cvdTotal} | TopCluster price=${head.price} buy=${head.buy} sell=${head.sell} imbal=${head.imbalance.toFixed(2)}`
+        );
+      } else {
+        console.debug(`[OF] CVD=${diag.cvdTotal} | TopCluster none`);
+      }
+    } catch {}
     this.barOpenPx = closePx!;
     this.barHighPx = closePx!;
     this.barLowPx = closePx!;
@@ -410,14 +587,9 @@ export class MNQDeltaTrendTrader {
     bar: BarData
   ) {
     if (signal.signal === 'hold') return;
-
-    // Hard block if entry or flatten in-flight
     if (this.isEnteringPosition || this.isFlattening) return;
-
-    // Don't add to position
     if (this.calculator.hasPosition()) return;
 
-    // If we scratched intrabar and are flat, allow bar-close to re-enter; otherwise block same-bar overlap
     if (this.enteredBarStartMs === this.barStartMs && (this.isEnteringPosition || this.calculator.hasPosition())) return;
 
     // ATR gate
@@ -426,9 +598,34 @@ export class MNQDeltaTrendTrader {
     if (!Number.isFinite(atrNow) || atrNow < minAtr) return;
 
     const direction = signal.signal === 'buy' ? 'long' : 'short';
+
+    // ---- NEW: CVD slope gate (optional) ----
+    if ((this.config as any).useCvdSlopeGate === true) {
+      if (!this.cvdSlopePass(direction)) return;
+    }
+
+    // ---- NEW: Order-flow cluster guard (optional) ----
+    if ((this.config as any).useClusterGuard === true) {
+      if (!this.clusterGuardPass(direction, bar.close)) return;
+    }
+
     const qty = Math.max(1, this.config.contractQuantity ?? 1);
 
-    // Pre-mark the bar to block intrabar overlap; rollback on failure
+    // --- Order-Flow Gates (CVD + Cluster) ---
+    if ((this.config as any).useCvdSlopeGate === true) {
+      if (!this.cvdSlopePass(direction)) {
+        console.debug('[Gate][CVD] blocked@close', { dir: direction });
+        return;
+      }
+    }
+
+    if ((this.config as any).useClusterGuard === true) {
+      if (!this.clusterGuardPass(direction, bar.close)) {
+        console.debug('[Gate][Cluster] blocked@close', { dir: direction, px: bar.close });
+        return;
+      }
+    }
+
     const barGate = this.barStartMs;
     this.enteredBarStartMs = barGate;
 
@@ -448,5 +645,27 @@ export class MNQDeltaTrendTrader {
       console.error('[MNQDeltaTrend][order] placement failed:', err);
       if (this.enteredBarStartMs === barGate) this.enteredBarStartMs = null;
     }
+  }
+
+    /** Passive diagnostics — safe for UI/logs; zero strategy impact */
+  public getOrderFlowSnapshot(): {
+    cvdTotal: number;
+    cvdLast3: Array<{ t: number; cvd: number }>;
+    topClusters: Array<{ price: number; buy: number; sell: number; imbalance: number }>;
+  } {
+    // Top 10 clusters by (buy+sell) volume within current 3m bar
+    const clusters: Array<{ price: number; buy: number; sell: number; imbalance: number }> = [];
+    for (const [price, v] of this.clusterByPrice.entries()) {
+      const tot = (v.buy || 0) + (v.sell || 0);
+      if (tot <= 0) continue;
+      const imbalance = tot > 0 ? Math.abs((v.buy - v.sell) / tot) : 0;
+      clusters.push({ price, buy: v.buy, sell: v.sell, imbalance });
+    }
+    clusters.sort((a, b) => (b.buy + b.sell) - (a.buy + a.sell));
+    return {
+      cvdTotal: this.cvdTotal,
+      cvdLast3: this.cvdByBar.slice(-3),
+      topClusters: clusters.slice(0, 10),
+    };
   }
 }

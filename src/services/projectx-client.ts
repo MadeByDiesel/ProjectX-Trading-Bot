@@ -10,6 +10,7 @@ import {
   Contract, 
   Quote,
   GatewayQuote,
+  GatewayDepth, 
   GatewayUserOrder,
   GatewayUserPosition,
   GatewayUserTrade,
@@ -172,28 +173,6 @@ export class ProjectXClient {
     if (!response.success) throw new Error(response.errorMessage);
     return response.orders;
   }
-
-  // async createOrder(orderRequest: {
-  //   contractId: string;
-  //   type: number;
-  //   side: number;
-  //   size: number;
-  //   limitPrice?: number;
-  //   stopPrice?: number;
-  //   trailPrice?: number;
-  //   customTag?: string;
-  //   linkedOrderId?: number;
-  // }): Promise<number> {
-  //   await this.initialize();
-  //   if (!this.selectedAccountId) throw new Error('No account selected');
-    
-  //   const response = await this.apiService.placeOrder({
-  //     accountId: this.selectedAccountId,
-  //     ...orderRequest
-  //   });
-  //   if (!response.success) throw new Error(response.errorMessage);
-  //   return response.orderId;
-  // }
 
   async createOrder(orderRequest: {
     contractId: string;
@@ -400,6 +379,10 @@ export class ProjectXClient {
     this.signalRService.on('market_data', callback);
   }
 
+  onDepth(callback: (data: { contractId: string; timestamp: string; type: number; price: number; volume: number; currentVolume: number }) => void): void {
+    (this.signalRService as any).on('market_depth', callback);
+  }
+  
   onOrderUpdate(callback: (order: GatewayUserOrder) => void): void {
     this.signalRService.on('order_update', callback);
   }

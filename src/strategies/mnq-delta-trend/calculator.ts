@@ -435,9 +435,8 @@ export class MNQDeltaTrendCalculator {
       (dir === 'short' && (entryPrice - px) >= actPts);
 
     if (!reachedActivation) {
-      // keep stops snapped
+      // keep trail snapped; do NOT mirror into hard stop
       this.trailingStopLevel = snapStop(this.trailingStopLevel, dir);
-      this.currentPosition.stopLoss = this.trailingStopLevel;
 
       if ((dir === 'long' && px <= this.trailingStopLevel) ||
           (dir === 'short' && px >= this.trailingStopLevel)) {
@@ -449,13 +448,13 @@ export class MNQDeltaTrendCalculator {
     if (dir === 'long') {
       const candidate = snapStop(px - offPts, 'long');
       if (candidate > this.trailingStopLevel) this.trailingStopLevel = candidate;
-      this.currentPosition.stopLoss = this.trailingStopLevel;
+      // do NOT mirror trail into hard stop
       if (px <= this.trailingStopLevel) return 'hitTrail';
     } else {
-      const candidate = snapStop(px + offPts, 'short');
-      if (candidate < this.trailingStopLevel) this.trailingStopLevel = candidate;
-      this.currentPosition.stopLoss = this.trailingStopLevel;
-      if (px >= this.trailingStopLevel) return 'hitTrail';
+        const candidate = snapStop(px + offPts, 'short');
+        if (candidate < this.trailingStopLevel) this.trailingStopLevel = candidate;
+        // do NOT mirror trail into hard stop
+        if (px >= this.trailingStopLevel) return 'hitTrail';
     }
     return 'none';
   }

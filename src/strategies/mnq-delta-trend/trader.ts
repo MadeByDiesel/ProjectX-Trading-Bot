@@ -53,63 +53,68 @@ export class MNQDeltaTrendTrader {
   private clusterByPrice = new Map<number, { buy: number; sell: number; lastTs: number }>();
 
   // --- CVD / Clustering gates (passive → active when enabled) ---
+    // === Phase 6 unified gate control ===
+  private gateOn(key: string): boolean {
+    const cfg = this.config as any;
+    return cfg[key] !== false; // defaults TRUE if missing
+  }
 
-/** Return true if CVD slope agrees with direction over the last N snapshots. */
-private cvdSlopePass(dir: 'long' | 'short'): boolean {
-  const cfg = this.config as any;
-  if (!Array.isArray(this.cvdByBar) || this.cvdByBar.length < 2) return true;
+  /** Return true if CVD slope agrees with direction over the last N snapshots. */
+  private cvdSlopePass(dir: 'long' | 'short'): boolean {
+    const cfg = this.config as any;
+    if (!Array.isArray(this.cvdByBar) || this.cvdByBar.length < 2) return true;
 
-  const n = Math.max(2, Number(cfg.cvdSlopeLen ?? 3));
-  if (this.cvdByBar.length < n) return true;
+    const n = Math.max(2, Number(cfg.cvdSlopeLen ?? 3));
+    if (this.cvdByBar.length < n) return true;
 
-  const tail = this.cvdByBar.slice(-n);
-  const start = tail[0]?.cvd ?? 0;
-  const end = tail[tail.length - 1]?.cvd ?? 0;
-  const slope = end - start; // simple delta across window
+    const tail = this.cvdByBar.slice(-n);
+    const start = tail[0]?.cvd ?? 0;
+    const end = tail[tail.length - 1]?.cvd ?? 0;
+    const slope = end - start; // simple delta across window
 
-  const minAbs = Math.max(0, Number(cfg.cvdSlopeMinAbs ?? 0));
-  if (Math.abs(slope) < minAbs) return false;
+    const minAbs = Math.max(0, Number(cfg.cvdSlopeMinAbs ?? 0));
+    if (Math.abs(slope) < minAbs) return false;
 
-  return dir === 'long' ? slope > 0 : slope < 0;
-}
+    return dir === 'long' ? slope > 0 : slope < 0;
+  }
 
-/**
- * Return true if no heavy opposing cluster is "ahead" of price within X ticks.
- * For longs: block if SELL-dominant cluster ahead; for shorts: BUY-dominant below.
- */
-private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
-  if (this.clusterByPrice.size === 0 || !Number.isFinite(refPrice)) return true;
+  /**
+   * Return true if no heavy opposing cluster is "ahead" of price within X ticks.
+   * For longs: block if SELL-dominant cluster ahead; for shorts: BUY-dominant below.
+   */
+  private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
+    if (this.clusterByPrice.size === 0 || !Number.isFinite(refPrice)) return true;
 
-  const cfg = this.config as any;
-  const tickSize = 0.25;
-  const aheadTicks = Math.max(1, Number(cfg.clusterAheadTicks ?? 8));
-  const minVol = Math.max(0, Number(cfg.clusterMinVolume ?? 200));
-  const imbThr = Math.min(0.99, Math.max(0, Number(cfg.clusterImbalanceThreshold ?? 0.65)));
+    const cfg = this.config as any;
+    const tickSize = 0.25;
+    const aheadTicks = Math.max(1, Number(cfg.clusterAheadTicks ?? 8));
+    const minVol = Math.max(0, Number(cfg.clusterMinVolume ?? 200));
+    const imbThr = Math.min(0.99, Math.max(0, Number(cfg.clusterImbalanceThreshold ?? 0.65)));
 
-  const refKey = Math.round(refPrice / tickSize) * tickSize;
+    const refKey = Math.round(refPrice / tickSize) * tickSize;
 
-  for (const [price, v] of this.clusterByPrice.entries()) {
-    const tot = (v.buy || 0) + (v.sell || 0);
-    if (tot < minVol) continue;
+    for (const [price, v] of this.clusterByPrice.entries()) {
+      const tot = (v.buy || 0) + (v.sell || 0);
+      if (tot < minVol) continue;
 
-    const imbalance = tot > 0 ? Math.abs((v.buy - v.sell) / tot) : 0;
+      const imbalance = tot > 0 ? Math.abs((v.buy - v.sell) / tot) : 0;
 
-    if (dir === 'long') {
-      const ticksAhead = Math.round((price - refKey) / tickSize);
-      const sellDominant = v.sell > v.buy;
-      if (ticksAhead > 0 && ticksAhead <= aheadTicks && sellDominant && imbalance >= imbThr) {
-        return false; // heavy sell wall ahead
-      }
-    } else {
-      const ticksBelow = Math.round((refKey - price) / tickSize);
-      const buyDominant = v.buy > v.sell;
-      if (ticksBelow > 0 && ticksBelow <= aheadTicks && buyDominant && imbalance >= imbThr) {
-        return false; // heavy buy wall below (into us)
+      if (dir === 'long') {
+        const ticksAhead = Math.round((price - refKey) / tickSize);
+        const sellDominant = v.sell > v.buy;
+        if (ticksAhead > 0 && ticksAhead <= aheadTicks && sellDominant && imbalance >= imbThr) {
+          return false; // heavy sell wall ahead
+        }
+      } else {
+        const ticksBelow = Math.round((refKey - price) / tickSize);
+        const buyDominant = v.buy > v.sell;
+        if (ticksBelow > 0 && ticksBelow <= aheadTicks && buyDominant && imbalance >= imbThr) {
+          return false; // heavy buy wall below (into us)
+        }
       }
     }
+    return true;
   }
-  return true;
-}
 
   // Minimal market state
   private marketState = {
@@ -492,8 +497,8 @@ private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
         return;
       }
 
-      // --- Order-Flow Gates (single pass) ---
-      if ((this.config as any).useCvdSlopeGate === true && !this.cvdSlopePass(direction)) {
+      // --- Order-Flow Gates (single pass, Phase 6) ---
+      if (this.gateOn('useCvdSlopeGate') && !this.cvdSlopePass(direction)) {
         console.debug('[Gate][CVD] blocked@intra', {
           dir: direction,
           len: (this.config as any).cvdSlopeLen,
@@ -503,7 +508,8 @@ private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
         this.isEnteringPosition = false;
         return;
       }
-      if ((this.config as any).useClusterGuard === true && !this.clusterGuardPass(direction, bar.close)) {
+
+      if (this.gateOn('useClusterGuard') && !this.clusterGuardPass(direction, bar.close)) {
         console.debug('[Gate][Cluster] blocked@intra', { dir: direction, px: bar.close });
         this.enteredBarStartMs = null;
         this.isEnteringPosition = false;
@@ -559,6 +565,11 @@ private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
     this.volInBarByContract.set(contractId, 0);
     this.signedVolInBarByContract.set(contractId, 0);
 
+    // Update live ATR for gating parity
+    try {
+      this.marketState.atr = this.calculator.getAtr ? this.calculator.getAtr() : this.marketState.atr;
+    } catch {}
+
     // Process bar-close signal
     const signal = this.calculator.processNewBar(closedBar as any, this.marketState as any);
     void this.handleSignal(signal, closedBar);
@@ -599,32 +610,17 @@ private clusterGuardPass(dir: 'long' | 'short', refPrice: number): boolean {
 
     const direction = signal.signal === 'buy' ? 'long' : 'short';
 
-    // ---- NEW: CVD slope gate (optional) ----
-    if ((this.config as any).useCvdSlopeGate === true) {
-      if (!this.cvdSlopePass(direction)) return;
+    // --- Order-Flow Gates (single pass, Phase 6) ---
+    if (this.gateOn('useCvdSlopeGate') && !this.cvdSlopePass(direction)) {
+      console.debug('[Gate][CVD] blocked@close', { dir: direction });
+      return;
     }
-
-    // ---- NEW: Order-flow cluster guard (optional) ----
-    if ((this.config as any).useClusterGuard === true) {
-      if (!this.clusterGuardPass(direction, bar.close)) return;
+    if (this.gateOn('useClusterGuard') && !this.clusterGuardPass(direction, bar.close)) {
+      console.debug('[Gate][Cluster] blocked@close', { dir: direction, px: bar.close });
+      return;
     }
 
     const qty = Math.max(1, this.config.contractQuantity ?? 1);
-
-    // --- Order-Flow Gates (CVD + Cluster) ---
-    if ((this.config as any).useCvdSlopeGate === true) {
-      if (!this.cvdSlopePass(direction)) {
-        console.debug('[Gate][CVD] blocked@close', { dir: direction });
-        return;
-      }
-    }
-
-    if ((this.config as any).useClusterGuard === true) {
-      if (!this.clusterGuardPass(direction, bar.close)) {
-        console.debug('[Gate][Cluster] blocked@close', { dir: direction, px: bar.close });
-        return;
-      }
-    }
 
     const barGate = this.barStartMs;
     this.enteredBarStartMs = barGate;

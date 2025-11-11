@@ -1,7 +1,7 @@
 import { ProjectXClient } from '../../services/projectx-client';
 import { MNQDeltaTrendCalculator } from './calculator';
 import { StrategyConfig } from './types';
-import { GatewayQuote, GatewayDepth, BarData, DomType } from '../../types';
+import { GatewayQuote, BarData, DomType } from '../../types';
 import { execFile, ExecFileException, ExecFileOptionsWithStringEncoding } from 'child_process';
 
 export class MNQDeltaTrendTrader {
@@ -496,6 +496,8 @@ export class MNQDeltaTrendTrader {
         this.isEnteringPosition = false;
         return;
       }
+      // ensure tick-stop path receives correct ATR immediately
+      this.marketState.atr = atr;
 
       // --- Order-Flow Gates (single pass, Phase 6) ---
       if (this.gateOn('useCvdSlopeGate') && !this.cvdSlopePass(direction)) {
@@ -567,7 +569,7 @@ export class MNQDeltaTrendTrader {
 
     // Update live ATR for gating parity
     try {
-      this.marketState.atr = this.calculator.getAtr ? this.calculator.getAtr() : this.marketState.atr;
+      this.marketState.atr = (this.calculator as any)?.getAtr?.() ?? this.marketState.atr;
     } catch {}
 
     // Process bar-close signal
